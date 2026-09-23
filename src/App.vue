@@ -1,11 +1,19 @@
 <script setup>
-import { onBeforeUnmount, onMounted, reactive, ref, shallowRef } from 'vue'
+import { defineAsyncComponent, onBeforeUnmount, onMounted, reactive, ref, shallowRef } from 'vue'
 import { VTOEngine } from './vto/VTOEngine.js'
 import { CATALOG, getBracelet } from './vto/assets/catalog.js'
 import VtoStage from './components/VtoStage.vue'
 import CatalogPanel from './components/CatalogPanel.vue'
 import FitPanel from './components/FitPanel.vue'
 import DiagnosticsPanel from './components/DiagnosticsPanel.vue'
+/**
+ * The test-clip recorder is a development tool: it writes into fixtures/
+ * through the dev server. Loaded lazily behind DEV, so a production build
+ * drops it entirely.
+ */
+const DEV = import.meta.env.DEV
+const CapturePanel = DEV ? defineAsyncComponent(() => import('./components/CapturePanel.vue')) : null
+const CaptureOverlay = DEV ? defineAsyncComponent(() => import('./components/CaptureOverlay.vue')) : null
 
 const stage = ref(null)
 const engine = shallowRef(null)
@@ -35,6 +43,11 @@ const options = reactive({
   realisticPhysics: false,
 })
 const fits = ref([])
+
+const capturing = ref(false)
+const captureView = reactive({ active: false, status: 'idle', checks: [], results: {} })
+let captureSession = null
+let capturePollId = null
 
 let pollId = null
 
@@ -94,12 +107,32 @@ function setOption({ key, value }) {
   if (engine.value) engine.value.options[key] = value
 }
 
+async function openCapture() {
+  if (!DEV || !engine.value || captureSession) return
+  const { CaptureSession } = await import('./vto/capture/CaptureSession.js')
+  if (!engine.value || captureSession) return
+  captureSession = new CaptureSession(engine.value)
+  engine.value.capture = captureSession
+  capturing.value = true
+  Object.assign(captureView, captureSession.snapshot())
+  capturePollId = setInterval(() => Object.assign(captureView, captureSession.snapshot()), 60)
+}
+
+function closeCapture() {
+  if (capturePollId) clearInterval(capturePollId)
+  capturePollId = null
+  captureSession?.dispose()
+  captureSession = null
+  capturing.value = false
+}
+
 onMounted(() => {
   // Camera access needs a user gesture on most browsers, so we wait for one.
 })
 
 onBeforeUnmount(() => {
   if (pollId) clearInterval(pollId)
+  closeCapture()
   engine.value?.dispose()
 })
 </script>
@@ -113,6 +146,9 @@ onBeforeUnmount(() => {
         <span class="brand__sub">Bracelet Fitting Engine</span>
       </div>
       <div class="app__actions">
+        <button v-if="DEV && status === 'running'" class="ghost" @click="capturing ? closeCapture() : openCapture()">
+          {{ capturing ? 'Back to try-on' : 'Record test clips' }}
+        </button>
         <button v-if="status === 'running'" class="ghost" @click="engine.flipCamera()">Flip camera</button>
       </div>
     </header>
@@ -123,8 +159,10 @@ onBeforeUnmount(() => {
         :calibration="calibration"
         :state="diagnostics.state"
         :presence="diagnostics.presence"
+        :quiet="capturing"
         @skip-calibration="engine?.skipCalibration()"
       >
+        <CaptureOverlay v-if="capturing" :view="captureView" />
         <div v-if="status !== 'running'" class="gate">
           <div class="gate__card">
             <h1>Try bracelets on, at their real size.</h1>
@@ -142,14 +180,25 @@ onBeforeUnmount(() => {
       </VtoStage>
 
       <aside class="app__side">
-        <CatalogPanel :catalog="CATALOG" :selected="selected" @toggle="toggle" />
-        <FitPanel
-          :fits="fits"
-          :diagnostics="diagnostics"
-          :manual-wrist="manualWrist"
-          @set-manual-wrist="setManualWrist"
-          @recalibrate="engine?.recalibrate()"
+        <CapturePanel
+          v-if="capturing"
+          :view="captureView"
+          @start="captureSession?.start()"
+          @redo="(id) => captureSession?.redo(id)"
+          @skip="captureSession?.skip()"
+          @stop="captureSession?.stop()"
+          @close="closeCapture"
         />
+        <template v-else>
+          <CatalogPanel :catalog="CATALOG" :selected="selected" @toggle="toggle" />
+          <FitPanel
+            :fits="fits"
+            :diagnostics="diagnostics"
+            :manual-wrist="manualWrist"
+            @set-manual-wrist="setManualWrist"
+            @recalibrate="engine?.recalibrate()"
+          />
+        </template>
         <DiagnosticsPanel :diagnostics="diagnostics" :options="options" @update:option="setOption" />
       </aside>
     </main>

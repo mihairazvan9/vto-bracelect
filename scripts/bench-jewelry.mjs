@@ -117,7 +117,7 @@ function samplePiece(inst, twin, frameInv) {
 }
 
 export function runJewelry(fixture, { configure, realistic: real = realistic } = {}) {
-  const cam = new CameraModel()
+  const cam = new CameraModel({ fovYDeg: fixture.meta?.fovYDeg })
   cam.setResolution(fixture.videoWidth, fixture.videoHeight, false)
   const observer = new WristObserver(cam)
   const tracker = new WristTracker(cam)

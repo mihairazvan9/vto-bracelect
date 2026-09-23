@@ -186,6 +186,8 @@ export class VTOEngine {
     /** When the video frame currently on screen arrived; the pose is rendered for it. */
     this._displayTime = 0
     this._solveIndices = []
+    /** A CaptureSession recording test clips, or null (dev tool). */
+    this.capture = null
   }
 
   async start(constraints) {
@@ -297,10 +299,11 @@ export class VTOEngine {
 
       // Re-solve whenever either detector produced something new, not just the
       // hand: in pose-only mode the hand never updates at all.
+      let observation = null
       if (this.perception.revision !== this._lastRevision) {
         this._lastRevision = this.perception.revision
         const source = this.sources.build(this.perception.hands, this.cameraModel)
-        const observation = this.observer.observe(source, this.perception, now)
+        observation = this.observer.observe(source, this.perception, now)
         if (observation) {
           this.tracker.ingest(observation)
           this.lastLandmarks3D = observation.landmarks3D
@@ -318,6 +321,13 @@ export class VTOEngine {
             this._armOverlay = null
           }
         }
+      }
+
+      // Guided recording (dev tool, src/vto/capture): one sample for every
+      // camera frame the hand detector ran on, with what it and the arm
+      // segmentation made of that frame.
+      if (this.capture && this.perception.handTimestamp === now) {
+        this.capture.onFrame(this._captureSample(now, observation))
       }
     }
 
@@ -473,6 +483,21 @@ export class VTOEngine {
     this.has2D = n === 21
   }
 
+  /** What a CaptureSession gets per recorded frame. Valid only during the call. */
+  _captureSample(now, observation) {
+    return {
+      now,
+      captureTimeMs: this.stream.frameTimeMs(now),
+      video: this.stream.video,
+      hands: this.perception.hands,
+      armMask: this.perception.armMask,
+      roiRgba: this.perception.arm.lastRoiRgba,
+      observation,
+      tracker: this.tracker,
+      cam: this.cameraModel,
+    }
+  }
+
   _snapshotRawFrame(observation) {
     const f = this.rawFrame
     f.x.copy(observation.basis.x)
@@ -617,6 +642,7 @@ export class VTOEngine {
 
   dispose() {
     this.stop()
+    this.capture?.dispose()
     this.perception.close()
     this.instances.forEach((i) => i.mesh.dispose())
     this.handDebug.dispose()

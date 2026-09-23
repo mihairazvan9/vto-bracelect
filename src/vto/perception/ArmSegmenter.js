@@ -166,6 +166,8 @@ export class ArmSegmenter {
       this.armMask = null
       return false
     }
+    /** This frame's region-of-interest pixels (RGBA), e.g. for exposure checks. */
+    this.lastRoiRgba = rgba
 
     // Network prior for each ROI pixel, motion-compensated: the arm has moved
     // with the wrist since the network looked at it.

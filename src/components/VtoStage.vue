@@ -8,6 +8,8 @@ defineProps({
   calibration: { type: Object, required: true },
   state: { type: String, default: 'LOST' },
   presence: { type: Number, default: 0 },
+  /** Hide the stage's own hints (another overlay, e.g. the clip recorder, is talking). */
+  quiet: { type: Boolean, default: false },
 })
 defineEmits(['skip-calibration'])
 </script>
@@ -19,7 +21,8 @@ defineEmits(['skip-calibration'])
 
     <!-- Confidence-aware UI: never a hard "not detected", always a reason. -->
     <transition name="fade">
-      <div v-if="state === 'LOST'" class="stage__hint">
+      <div v-if="quiet" />
+      <div v-else-if="state === 'LOST'" class="stage__hint">
         <span class="dot dot--lost" />
         Show your wrist to the camera
       </div>
@@ -30,7 +33,7 @@ defineEmits(['skip-calibration'])
     </transition>
 
     <transition name="fade">
-      <div v-if="calibration.active && state !== 'LOST'" class="calib">
+      <div v-if="!quiet && calibration.active && state !== 'LOST'" class="calib">
         <div class="calib__prompt">{{ calibration.prompt }}</div>
         <div class="calib__bar">
           <div class="calib__fill" :style="{ width: `${Math.round(calibration.coverage * 100)}%` }" />

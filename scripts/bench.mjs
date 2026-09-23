@@ -16,6 +16,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import * as THREE from 'three'
 import { decodeFixture } from '../src/vto/replay/fixtureFormat.js'
+import { decodeArmMasks, sampleArmMask } from '../src/vto/replay/armMaskFormat.js'
 import { CameraModel } from '../src/vto/camera/CameraModel.js'
 import { WristObserver } from '../src/vto/wrist/WristObserver.js'
 import { WristTracker } from '../src/vto/wrist/WristTracker.js'
@@ -34,7 +35,7 @@ const masksIdx = args.indexOf('--masks')
  * ArmSegmenter) instead of the clip's recorded full-frame category mask.
  */
 const maskMethod = masksIdx >= 0 ? args[masksIdx + 1] : null
-const only = args.filter((a, i) => !a.startsWith('--') && i !== masksIdx + 1)
+const only = args.filter((a, i) => !a.startsWith('--') && (masksIdx < 0 || i !== masksIdx + 1))
 
 /** Perception stand-in fed from an eval-harness soft mask at frame resolution. */
 function softPerception(clipId, fixture, frame) {
@@ -61,8 +62,21 @@ function softPerception(clipId, fixture, frame) {
   }
 }
 
-/** Perception stand-in fed from the recorded category mask. */
+/**
+ * Perception stand-in for one frame. Clips recorded in the app (src/vto/capture)
+ * carry the live pipeline's own soft arm mask per frame (armmask.bin), which
+ * is replayed exactly - region of interest, bilinear lookup, "unknown" outside
+ * it - so the replay sees what the app saw. Older clips fall back to their
+ * hard full-frame category mask.
+ */
 export function maskPerception(fixture, frame) {
+  if (fixture.armMasks) {
+    const mask = fixture.armMasks[frame.index] ?? null
+    return {
+      armMask: mask ? { ...mask, version: frame.index + 1 } : null,
+      sampleMask: (u, v) => sampleArmMask(mask, u, v),
+    }
+  }
   const w = fixture.categoryMaskWidth
   const h = fixture.categoryMaskHeight
   const data = new Uint8Array(w * h)
@@ -122,7 +136,7 @@ function secondDiffPx(series) {
   return out
 }
 
-export function runClip(fixture, { fovYDeg, configure, clipId } = {}) {
+export function runClip(fixture, { fovYDeg = fixture.meta?.fovYDeg, configure, clipId } = {}) {
   const cam = new CameraModel({ fovYDeg })
   cam.setResolution(fixture.videoWidth, fixture.videoHeight, false)
   const observer = new WristObserver(cam)
@@ -208,7 +222,24 @@ export function loadClips(filter = []) {
     .filter((id) => !filter.length || filter.includes(id))
     .map((id) => ({ id, file: path.join(FIXTURES, id, 'recording.v1.bin') }))
     .filter((c) => fs.existsSync(c.file))
-    .map((c) => ({ id: c.id, fixture: decodeFixture(fs.readFileSync(c.file)) }))
+    .map((c) => ({ id: c.id, fixture: withSidecars(decodeFixture(fs.readFileSync(c.file)), path.dirname(c.file)) }))
+}
+
+/**
+ * Attach what the in-app recorder writes next to a clip: capture.json
+ * (scenario, lens, timing) as `meta`, armmask.bin as `armMasks` (one entry per
+ * frame, null where the app had no mask).
+ */
+function withSidecars(fixture, dir) {
+  const metaFile = path.join(dir, 'capture.json')
+  if (fs.existsSync(metaFile)) fixture.meta = JSON.parse(fs.readFileSync(metaFile, 'utf8'))
+  const maskFile = path.join(dir, 'armmask.bin')
+  if (fs.existsSync(maskFile)) {
+    const { frames } = decodeArmMasks(fs.readFileSync(maskFile))
+    if (frames.length === fixture.frames.length) fixture.armMasks = frames
+    else console.warn(`${dir}: armmask.bin has ${frames.length} frames, clip has ${fixture.frames.length} - ignored`)
+  }
+  return fixture
 }
 
 const f1 = (v) => (Number.isFinite(v) ? v.toFixed(1) : '  - ')

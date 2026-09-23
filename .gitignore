@@ -40,6 +40,7 @@ __screenshots__/
 
 # Recorded camera clips: real people, keep out of version control
 fixtures/**/*.bin
+fixtures/**/capture.json
 
 # Evaluation data derived from the recordings (reference masks, model outputs)
 tools/eval/node_modules

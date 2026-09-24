@@ -1,475 +1,502 @@
 import * as THREE from 'three'
 import { WALL_NEAR_MM, WALL_FAR_MM } from './walls.js'
-import { ArmInertia, INERTIA_REALISTIC, INERTIA_STABLE } from './ArmInertia.js'
-import { clamp } from '../core/mathUtils.js'
+import { ArmInertia } from './ArmInertia.js'
+import { JewelleryFrame } from './JewelleryFrame.js'
+import { armContact, armSection } from './armTube.js'
+import { livelinessFrom, physicsTuning } from './tuning.js'
+import { BraceletCategory } from '../assets/schema.js'
+
+/**
+ * Fixed simulation step, s. XPBD converges best with many small steps and a
+ * single constraint pass each (Macklin et al., "Small Steps in Physics
+ * Simulation", 2019): stiffer links, less artificial damping, and the result
+ * no longer depends on how often the display asks for a frame.
+ */
+const STEP_S = 1 / 600
+const MAX_CATCH_UP_S = 0.1
+const GRAVITY_MM_S2 = 9810
+const DOWN = new THREE.Vector3(0, -1, 0)
+/** The loop settles here when first put on the arm, out of sight, s. */
+const PRESETTLE_S = 0.8
+/** The resting station moves at most this fast when the fit changes it, mm/s. */
+const REST_GLIDE_MM_S = 40
+/** Hard limit on a link's speed: a last line of defence, never reached in normal use, mm/s. */
+const MAX_SPEED_MM_S = 3000
+/** A chain lies on skin all round, so it follows the arm's twist faster than a loose bangle. */
+const CHAIN_TWIST_FOLLOW = 1.6
 
 const _d = new THREE.Vector3()
 const _v = new THREE.Vector3()
 const _acc = new THREE.Vector3()
 const _tmp = new THREE.Vector3()
-const _pos = new THREE.Vector3()
-const _scale = new THREE.Vector3()
-const _toArm = new THREE.Quaternion()
-const _n = new THREE.Vector3()
-
-const GRAVITY_MM_S2 = 9810 // mm/s^2
-const DOWN = new THREE.Vector3(0, -1, 0)
-
-/** Arm-space stations the tube is modelled over (the collision surface). */
-const TUBE_MIN_S = -10
-const TUBE_MAX_S = 120
-
-/**
- * Deeper than this inside the arm (in ellipse units, f = r^2 / R^2) a link
- * cannot have got by sliding over the skin: it was knocked through. It is put
- * back out on the side it came from, not the side it happens to be on.
- */
-const TUNNEL_F = 0.36
-
-/** Metal on skin: friction coefficients (static holds, kinetic slows a slide). */
-const MU_STATIC = 0.7
-const MU_KINETIC = 0.45
+const _tmp2 = new THREE.Vector3()
+const _toSim = new THREE.Quaternion()
+const _g = new THREE.Vector3()
+const _w = new THREE.Vector3()
+const _alpha = new THREE.Vector3()
+const _contact = { x: 0, z: 0, nx: 0, nz: 0, depth: 0 }
+const _section = { a: 0, b: 0 }
 
 /**
  * XPBD solver for articulated jewellery: tennis bracelets, chains, charms.
  *
- * A chain is not a torus. It hangs, it sags under the wrist, it slides around
- * when the arm turns, and its charms swing. Modelling it as particles with
- * distance and bend constraints, colliding against the wrist twin, is what
- * produces that for free.
+ * A chain is particles joined by inextensible links, with bending that
+ * depends on the piece - a tennis bracelet's hinged links curve round the
+ * wrist but keep the band flat along the arm; a rope chain drapes both ways -
+ * colliding with the arm's tube, held by skin friction, bounded by the two
+ * wall planes, and charms hang from their links as pendulums that pull on them.
  *
- * THE SIMULATION RUNS IN ARM SPACE (WristDigitalTwin.frameMatrix): the tube,
- * its two wall planes and every link are expressed in the arm's own frame,
- * where the arm never moves. Tracking jitter therefore cannot teleport the
- * tube through the links - which, in world space, is exactly how a chain got
- * knocked off the wrist: a pose step the size of the wrist's radius put links
- * past the arm's axis, collision pushed them out the wrong side, and the loop
- * no longer went round the arm.
+ * It runs in the JewelleryFrame (the arm frame with its twist followed
+ * softly), so tracking noise can neither shake the tube through the links nor
+ * turn the loop round the wrist; the arm's real motion reaches it as the
+ * fictitious forces of that frame, filtered (ArmInertia). Fixed 600 Hz steps,
+ * interpolated for display.
  *
- * The arm's real motion still reaches the chain, as the fictitious forces of
- * a moving frame, filtered so that only genuine motion does (ArmInertia).
- * `particles` / `charms[].position` are published in world space every solve
- * for anything that wants them; the renderer draws straight from arm space.
+ * Published every solve:
+ *   local       link positions in the ARM's frame (twin.frameMatrix), which is
+ *               also `frame`, the matrix the renderer draws them under
+ *   particles   the same in world space
+ *   charms[].local / .position   likewise
  */
 export class XPBDChainSolver {
   constructor() {
-    /** Arm-space state: x radial, y along the arm (mm from the crease), z dorsal. */
     this.local = []
-    this.prevLocal = []
-    /** World-space copy of `local`, refreshed at the end of every solve. */
     this.particles = []
     this.invMass = []
     this.charms = []
     this.linkLength = 5
     this.initialised = false
-    this.substeps = 4
-    // Loose, heavy-sag loops need more Gauss-Seidel passes than a stiff tennis
-    // bracelet does; this is the budget that converges the worst case.
-    this.iterations = 5
-    this.bendStiffness = 0.5
-    this.damping = 0.06
     this.maxContact = 0
-
-    /** World-from-arm transform the current state is expressed in. */
+    /** Arm frame the published `local` is expressed in (the renderer's matrix). */
     this.frame = new THREE.Matrix4()
     this.frameQuaternion = new THREE.Quaternion()
+    this.jframe = new JewelleryFrame()
     this.inertia = new ArmInertia()
-    /** Arm-space acceleration field this step: uniform part, rotation (rad/s, rad/s^2). */
-    this._g = new THREE.Vector3()
-    this._w = new THREE.Vector3()
-    this._alpha = new THREE.Vector3()
-
     /**
      * Times the loop was found not to go round the arm and was re-seated.
      * A safety net that should never fire; counted so it is visible if it does.
      */
     this.recoveries = 0
     this.walls = { nearS: WALL_NEAR_MM, farS: WALL_FAR_MM }
+
+    /** Link positions in the simulation's own frame (JewelleryFrame): the physical state. */
+    this.sim = []
+    this._vel = []
+    this._prev = []
+    this._contactDepth = new Float32Array(0)
+    this._acc = 0
+    this._rest = null
+    this._g = new THREE.Vector3()
+    this._w = new THREE.Vector3()
+    this._alpha = new THREE.Vector3()
+    this._forward = false
+    this._squeeze = 1
   }
 
   reset() {
     this.initialised = false
+    this._rest = null
+    this.jframe.reset()
     this.inertia.reset()
   }
 
-  /** Lay the loop out round the arm at its resting station. */
-  _initialise(asset, fit) {
-    const n = asset.links.count
-    this.local = []
-    this.prevLocal = []
-    this.particles = []
-    this.invMass = []
-    this.linkLength = asset.innerCircumferenceMm / n
-    this.bendStiffness = asset.links.bendStiffness
-    const massPerLink = Math.max(1e-3, asset.massG / n)
-
-    for (let i = 0; i < n; i++) {
-      const pos = new THREE.Vector3()
-      this.local.push(pos)
-      this.prevLocal.push(new THREE.Vector3())
-      this.particles.push(new THREE.Vector3())
-      this.invMass.push(1 / massPerLink)
+  /**
+   * @param {object} asset
+   * @param {object} fit
+   * @param {import('../wrist/WristDigitalTwin.js').WristDigitalTwin} twin
+   * @param {number} dt seconds since the last call
+   * @param {Array<{center:THREE.Vector3,axis:THREE.Vector3,radiusA:number,radiusB:number,stockRadiusMm:number}>} neighbours
+   *        other bracelets in the stack (world space)
+   * @param {{liveliness?: number, realistic?: boolean}} [options]
+   */
+  solve(asset, fit, twin, dt, neighbours = [], options = {}) {
+    const tune = physicsTuning(livelinessFrom(options))
+    const restarted = this.jframe.begin(twin)
+    const target = fit.restingOffsetMm
+    if (this._rest === null || restarted) this._rest = target
+    if (!this.initialised || restarted || this.sim.length !== asset.links.count) {
+      this._initialise(asset, fit, twin, tune)
     }
-    this._contactDepth = new Float32Array(n)
-    this._seat(fit)
 
+    _toSim.copy(this.jframe.quaternion).invert()
+    const stack = neighbours.map((nb) => nb.center.clone().sub(this.jframe.origin).applyQuaternion(_toSim).y)
+
+    // Skin gives (armTube fitSqueeze): a loop shorter than the arm is round
+    // cannot close outside it; the arm is squeezed to fit, not fought.
+    armSection(twin, this._rest, _section)
+    const pad = asset.stockRadiusMm + asset.fit.clearanceMm * 0.3
+    const loopR = asset.innerCircumferenceMm / (2 * Math.PI)
+    this._squeeze = Math.min(1, Math.max(0.5, (loopR * 0.97 - pad) / Math.max(1e-3, (_section.a + _section.b) / 2)))
+
+    this.maxContact = 0
+    this._acc = Math.min(this._acc + Math.max(0, dt), MAX_CATCH_UP_S)
+    while (this._acc >= STEP_S) {
+      this._rest += Math.max(-REST_GLIDE_MM_S * STEP_S, Math.min(REST_GLIDE_MM_S * STEP_S, target - this._rest))
+      this._step(STEP_S, asset, fit, twin, tune, stack)
+      this._acc -= STEP_S
+    }
+
+    // Safety net: the loop must still go once round the arm.
+    if (Math.abs(this._winding(fit)) !== 1) {
+      this.recoveries++
+      this._seat(fit)
+    }
+
+    twin.frameMatrix(this.frame)
+    this.frameQuaternion.setFromRotationMatrix(this.frame)
+    this._publish()
+    return this
+  }
+
+  // ------------------------------------------------------------------ setup
+
+  _initialise(asset, fit, twin, tune) {
+    const n = asset.links.count
+    this.linkLength = asset.innerCircumferenceMm / n
+    const massPerLink = Math.max(1e-3, asset.massG / n)
+    this.sim = Array.from({ length: n }, () => new THREE.Vector3())
+    this._vel = Array.from({ length: n }, () => new THREE.Vector3())
+    this._prev = Array.from({ length: n }, () => new THREE.Vector3())
+    this.local = Array.from({ length: n }, () => new THREE.Vector3())
+    this.particles = Array.from({ length: n }, () => new THREE.Vector3())
+    this.invMass = Array.from({ length: n }, () => 1 / massPerLink)
+    this._contactDepth = new Float32Array(n)
+    this._bending(asset, fit)
+    this._seat(fit)
     this.charms = (asset.charms ?? []).map((charm) => {
       const index = charm.linkIndex % n
-      const local = this.local[index].clone()
+      const x = this.sim[index].clone()
       return {
         spec: charm,
         index,
-        local,
-        prevLocal: local.clone(),
+        x,
+        vel: new THREE.Vector3(),
+        prev: x.clone(),
+        local: new THREE.Vector3(),
         position: new THREE.Vector3(),
         invMass: 1 / Math.max(1e-3, charm.massG),
       }
     })
     this._hangCharms()
     this.initialised = true
+    // Let it come to rest on the arm before anyone sees it.
+    const steps = Math.round(PRESETTLE_S / STEP_S)
+    for (let i = 0; i < steps; i++) this._step(STEP_S, asset, fit, twin, tune, [], true)
+    this.inertia.reset()
+    this._acc = 0
   }
 
-  /** Put the loop round the arm, at rest, at the fitted station. */
+  /**
+   * Bending compliance (s^2/g). Stiffness 0..1 from the asset maps onto four
+   * decades: a tennis bracelet (0.72) holds its arc, a rope chain (0.12) is
+   * limp. Across the arm the rest shape is the loop's own curve (see
+   * _solveBend) - straightening toward zero curvature fought the loop's
+   * closure and threw a stiff bracelet about. Along the arm a tennis band
+   * stays flat; a chain bends as freely that way as the other.
+   */
+  _bending(asset, fit) {
+    const s = Math.min(1, Math.max(0, asset.links.bendStiffness ?? 0.5))
+    this._bendCompliance = 10 ** (-6 + 4 * (1 - s))
+    this._flatCompliance = asset.category === BraceletCategory.TENNIS ? 1e-7 : this._bendCompliance
+    // A link's offset from its neighbours' midpoint on the rest loop (a circle
+    // of the bracelet's length): R (1 - cos(2 pi / n)).
+    const n = asset.links.count
+    const R = asset.innerCircumferenceMm / (2 * Math.PI)
+    this._restBend = R * (1 - Math.cos((2 * Math.PI) / n))
+  }
+
+  /** Lay the loop round the arm, at rest, at its station, aligned with the arm's section. */
   _seat(fit) {
-    const n = this.local.length
+    const n = this.sim.length
     for (let i = 0; i < n; i++) {
       const phi = (i / n) * Math.PI * 2
-      this.local[i].set(Math.cos(phi) * fit.ringA, fit.restingOffsetMm, Math.sin(phi) * fit.ringB)
-      this.prevLocal[i].copy(this.local[i])
+      this.sim[i].set(Math.cos(phi) * fit.ringA, this._rest ?? fit.restingOffsetMm, Math.sin(phi) * fit.ringB)
+      this._vel[i].set(0, 0, 0)
+      this._prev[i].copy(this.sim[i])
     }
+    this._hangCharms()
   }
 
-  /** Charms start hanging straight down (arm space) from their links. */
+  /** Charms start hanging straight down from their links. */
   _hangCharms() {
+    _d.copy(DOWN).applyQuaternion(_toSim.copy(this.jframe.quaternion).invert())
     for (const charm of this.charms) {
-      charm.local.copy(this.local[charm.index]).addScaledVector(_d.copy(this._g).normalize(), charm.spec.dropMm)
-      if (!Number.isFinite(charm.local.x)) charm.local.copy(this.local[charm.index])
-      charm.prevLocal.copy(charm.local)
+      charm.x.copy(this.sim[charm.index]).addScaledVector(_d, charm.spec.dropMm)
+      charm.vel.set(0, 0, 0)
+      charm.prev.copy(charm.x)
+    }
+  }
+
+  // ------------------------------------------------------------------- step
+
+  _step(h, asset, fit, twin, tune, stack, settling = false) {
+    const jf = this.jframe
+    if (settling) {
+      _g.copy(DOWN).applyQuaternion(_toSim.copy(jf.quaternion).invert()).multiplyScalar(GRAVITY_MM_S2)
+      _w.set(0, 0, 0)
+      _alpha.set(0, 0, 0)
+    } else {
+      jf.step(h, tune.twistFollowHz * CHAIN_TWIST_FOLLOW)
+      this.inertia.update(jf.matrix, h, tune.inertia)
+      _toSim.copy(jf.quaternion).invert()
+      _g.copy(DOWN).multiplyScalar(GRAVITY_MM_S2).sub(this.inertia.linearAcc).applyQuaternion(_toSim)
+      _w.copy(this.inertia.omega).applyQuaternion(_toSim)
+      _alpha.copy(this.inertia.angularAcc).applyQuaternion(_toSim)
+    }
+    const spin = _w.lengthSq() > 0 || _alpha.lengthSq() > 0
+    const damp = Math.exp(-tune.linearDamping * h)
+
+    // --- Predict ---------------------------------------------------------
+    for (let i = 0; i < this.sim.length; i++) {
+      const x = this.sim[i]
+      const v = this._vel[i]
+      this._field(x, v, spin, _acc)
+      v.addScaledVector(_acc, h).multiplyScalar(damp)
+      this._prev[i].copy(x)
+      x.addScaledVector(v, h)
+    }
+    for (const charm of this.charms) {
+      this._field(charm.x, charm.vel, spin, _acc)
+      charm.vel.addScaledVector(_acc, h).multiplyScalar(damp)
+      charm.prev.copy(charm.x)
+      charm.x.addScaledVector(charm.vel, h)
+    }
+
+    // --- Constraints (one pass: small steps do the converging) -----------
+    this._contactDepth.fill(0)
+    this._solveDistance()
+    this._solveBend(h)
+    this._solveCharms()
+    this._solveAxial(asset, tune, h)
+    for (const s of stack) this._solveNeighbour(s, asset)
+    // Hard constraints last, so nothing after them can pull a link back in -
+    // twice, with the links' length restored in between: collision moves
+    // links freely, and a visibly stretching chain reads as fake at once.
+    this._solveArm(asset, twin)
+    this._solveWalls(asset)
+    this._solveDistance()
+    this._solveArm(asset, twin)
+    this._solveWalls(asset)
+    this._solveFriction(tune)
+
+    // --- Velocities from positions -----------------------------------------
+    const inv = 1 / h
+    for (let i = 0; i < this.sim.length; i++) {
+      const v = this._vel[i].subVectors(this.sim[i], this._prev[i]).multiplyScalar(inv)
+      if (v.lengthSq() > MAX_SPEED_MM_S * MAX_SPEED_MM_S) v.setLength(MAX_SPEED_MM_S)
+    }
+    for (const charm of this.charms) {
+      charm.vel.subVectors(charm.x, charm.prev).multiplyScalar(inv)
+      if (charm.vel.lengthSq() > MAX_SPEED_MM_S * MAX_SPEED_MM_S) charm.vel.setLength(MAX_SPEED_MM_S)
     }
   }
 
   /**
-   * @param {number} dt seconds
-   * @param {Array<{center:THREE.Vector3,axis:THREE.Vector3,radiusA:number,radiusB:number,stockRadiusMm:number}>} neighbours
-   *        other bracelets in the stack (world space), for bracelet-to-bracelet collision
-   * @param {{realistic?: boolean}} [options]
-   */
-  solve(asset, fit, twin, dt, neighbours = [], { realistic = false } = {}) {
-    // --- The arm's frame, and what its motion does to the chain -------------
-    twin.frameMatrix(this.frame)
-    this.frame.decompose(_pos, this.frameQuaternion, _scale)
-    _toArm.copy(this.frameQuaternion).invert()
-    this.inertia.update(this.frame, dt, realistic ? INERTIA_REALISTIC : INERTIA_STABLE)
-    // Uniform field: gravity, minus the arm's own acceleration.
-    this._g.copy(DOWN).multiplyScalar(GRAVITY_MM_S2).sub(this.inertia.linearAcc).applyQuaternion(_toArm)
-    this._w.copy(this.inertia.omega).applyQuaternion(_toArm)
-    this._alpha.copy(this.inertia.angularAcc).applyQuaternion(_toArm)
-
-    if (!this.initialised || this.local.length !== asset.links.count) {
-      this._initialise(asset, fit)
-    }
-    this.walls = { nearS: WALL_NEAR_MM, farS: WALL_FAR_MM }
-    const h = Math.min(dt, 1 / 40) / this.substeps
-    this.maxContact = 0
-
-    const locals = neighbours.map((nb) => toArmNeighbour(nb, _pos, _toArm))
-
-    for (let step = 0; step < this.substeps; step++) {
-      if (h > 0) this._integrate(h)
-      this._contactDepth.fill(0)
-      for (let it = 0; it < this.iterations; it++) {
-        this._solveDistance()
-        if (this.bendStiffness > 0.01) this._solveBend()
-        this._solveAxialBand(asset, fit)
-        for (const nb of locals) this._solveNeighbour(nb, asset)
-        // Collision and the axial constraint both move particles freely, which
-        // stretches links. Re-solving distance keeps the chain's length
-        // credible: a visibly stretching chain reads as fake immediately.
-        this._solveDistance()
-        // The hard constraints go LAST, so nothing after them in the pass can
-        // pull a link back into the arm or past a wall.
-        this._solveWristCollision(asset, twin)
-        this._solveWalls(asset)
-      }
-      this._solveFriction(asset, twin)
-      if (h > 0) this._solveCharms(h, twin)
-    }
-
-    // Safety net: the loop must still go once round the arm. In arm space
-    // nothing should ever unthread it; if something does, re-seat it rather
-    // than let the bracelet fall off.
-    if (Math.abs(this._winding(fit)) !== 1) {
-      this.recoveries++
-      this._seat(fit)
-      this._hangCharms()
-    }
-
-    this._publish()
-    return this
-  }
-
-  /**
-   * Verlet in a moving frame. Per link:
-   *   a = g_arm - alpha x r - w x (w x r) - 2 w x v
+   * Acceleration of a point at r moving at v in the sim frame:
+   *   a = g - alpha x r - w x (w x r) - 2 w x v
    * (uniform field, Euler, centrifugal, Coriolis), all from the filtered arm
    * motion, so still-arm jitter contributes exactly nothing.
    */
-  _integrate(h) {
-    const drag = 1 - this.damping
-    const w = this._w
-    const spin = w.lengthSq() > 0 || this._alpha.lengthSq() > 0
-    for (let i = 0; i < this.local.length; i++) {
-      const p = this.local[i]
-      const prev = this.prevLocal[i]
-      _v.subVectors(p, prev)
-      this._field(p, _v, h, spin, _acc)
-      prev.copy(p)
-      p.addScaledVector(_v, drag).addScaledVector(_acc, h * h)
-    }
-  }
-
-  /** Arm-space acceleration at r moving by `step` this substep. */
-  _field(r, step, h, spin, out) {
-    out.copy(this._g)
+  _field(r, v, spin, out) {
+    out.copy(_g)
     if (!spin) return out
-    // Euler: - alpha x r
-    out.sub(_tmp.crossVectors(this._alpha, r))
-    // Centrifugal: - w x (w x r)
-    _d.crossVectors(this._w, r)
-    out.sub(_tmp.crossVectors(this._w, _d))
-    // Coriolis: - 2 w x v
-    out.addScaledVector(_tmp.crossVectors(this._w, step), -2 / h)
+    out.sub(_tmp.crossVectors(_alpha, r))
+    out.sub(_tmp.crossVectors(_w, _tmp2.crossVectors(_w, r)))
+    out.addScaledVector(_tmp.crossVectors(_w, v), -2)
     return out
   }
 
   /**
-   * Gauss-Seidel sweeps alternate direction. Always sweeping the loop the same
-   * way round leaves a small bias in that direction every pass, and on a
-   * closed loop a bias accumulates into circulation: the bracelet creeps
-   * round the wrist on its own.
+   * Gauss-Seidel sweeps alternate direction: always sweeping the loop the same
+   * way round leaves a small bias that, on a closed loop, accumulates into
+   * the bracelet creeping round the wrist on its own.
    */
   _flipSweep() {
     this._forward = !this._forward
     return this._forward
   }
 
+  /** Inextensible links (zero compliance). */
   _solveDistance() {
-    const pts = this.local
+    const pts = this.sim
     const n = pts.length
     const rest = this.linkLength
     const forward = this._flipSweep()
     for (let k = 0; k < n; k++) {
       const i = forward ? k : n - 1 - k
+      const j = (i + 1) % n
       const a = pts[i]
-      const b = pts[(i + 1) % n]
+      const b = pts[j]
       _d.subVectors(b, a)
       const len = _d.length()
       if (len < 1e-6) continue
       const wa = this.invMass[i]
-      const wb = this.invMass[(i + 1) % n]
-      const wsum = wa + wb
-      if (wsum < 1e-9) continue
-      const correction = (len - rest) / len / wsum
-      a.addScaledVector(_d, correction * wa)
-      b.addScaledVector(_d, -correction * wb)
+      const wb = this.invMass[j]
+      const c = (len - rest) / len / (wa + wb)
+      a.addScaledVector(_d, c * wa)
+      b.addScaledVector(_d, -c * wb)
     }
   }
 
   /**
-   * Bend constraint: pulls each particle toward the midpoint of its neighbours.
-   * A tennis bracelet with stiff links holds its arc; a rope chain barely does.
-   *
-   * Projected with the constraint's proper gradient weights (1, -1/2, -1/2),
-   * so the three moves cancel and the correction never shifts the loop as a
-   * whole. The earlier weights (1, -1/4, -1/4) nudged every triple toward its
-   * middle link; summed round a closed loop that is a push along it, and a
-   * stiff tennis bracelet spun ~190 deg/s round a perfectly still arm.
+   * Bending as XPBD constraints on each link's offset from the midpoint of its
+   * neighbours - along the arm (y: keeps a tennis band flat) and across it
+   * (x, z: holds the curve, relative to the rest loop's own curvature, which
+   * bows outward, away from the arm) - each with its own compliance. The
+   * gradient weights (1, -1/2, -1/2) cancel, so bending never shifts the loop
+   * as a whole round the arm.
    */
-  _solveBend() {
-    const pts = this.local
+  _solveBend(h) {
+    const pts = this.sim
     const n = pts.length
-    // x1.25 keeps the per-pass reduction of the bend error what it was.
-    const k = this.bendStiffness * 0.5 * 1.25
+    const aFlat = this._flatCompliance / (h * h)
+    const aBend = this._bendCompliance / (h * h)
+    const bow = this._restBend
     const forward = this._flipSweep()
-    for (let j = 0; j < n; j++) {
-      const i = forward ? j : n - 1 - j
-      const prev = pts[(i - 1 + n) % n]
+    for (let k = 0; k < n; k++) {
+      const i = forward ? k : n - 1 - k
+      const ip = (i - 1 + n) % n
+      const inx = (i + 1) % n
+      const prev = pts[ip]
       const cur = pts[i]
-      const next = pts[(i + 1) % n]
-      _d.addVectors(prev, next).multiplyScalar(0.5).sub(cur)
-      cur.addScaledVector(_d, (k * 2) / 3)
-      prev.addScaledVector(_d, -k / 3)
-      next.addScaledVector(_d, -k / 3)
+      const next = pts[inx]
+      const w = this.invMass[i] + (this.invMass[ip] + this.invMass[inx]) * 0.25
+      _d.addVectors(prev, next).multiplyScalar(0.5).sub(cur) // -C
+      // Rest offset: `bow` along the chord's perpendicular that points away
+      // from the arm (the side the link itself is on).
+      let px = -(next.z - prev.z)
+      let pz = next.x - prev.x
+      const pl = Math.hypot(px, pz)
+      if (pl > 1e-9) {
+        if (px * cur.x + pz * cur.z < 0) {
+          px = -px
+          pz = -pz
+        }
+        _d.x += (px / pl) * bow
+        _d.z += (pz / pl) * bow
+      }
+      const sy = _d.y / (w + aFlat)
+      const sxz = 1 / (w + aBend)
+      const dx = _d.x * sxz
+      const dz = _d.z * sxz
+      cur.x += dx * this.invMass[i]
+      cur.y += sy * this.invMass[i]
+      cur.z += dz * this.invMass[i]
+      prev.x -= dx * this.invMass[ip] * 0.5
+      prev.y -= sy * this.invMass[ip] * 0.5
+      prev.z -= dz * this.invMass[ip] * 0.5
+      next.x -= dx * this.invMass[inx] * 0.5
+      next.y -= sy * this.invMass[inx] * 0.5
+      next.z -= dz * this.invMass[inx] * 0.5
+    }
+  }
+
+  /** Charms on rigid pivots: two-way, so a heavy charm pulls its link down. */
+  _solveCharms() {
+    for (const charm of this.charms) {
+      const link = this.sim[charm.index]
+      _d.subVectors(charm.x, link)
+      const len = _d.length()
+      if (len < 1e-6) continue
+      const wl = this.invMass[charm.index]
+      const wc = charm.invMass
+      const c = (len - charm.spec.dropMm) / len / (wl + wc)
+      link.addScaledVector(_d, c * wl)
+      charm.x.addScaledVector(_d, -c * wc)
     }
   }
 
   /**
-   * Soft constraint keeping the loop near its resting station. Real chains
-   * do drift along the arm, but they do not wander off the wrist.
+   * Along the arm: a soft pull toward the resting station (how much depends on
+   * liveliness), and a band round it the loop does not leave - real chains
+   * drift along the arm, they do not wander off the wrist.
    */
-  _solveAxialBand(asset, fit) {
-    const rest = fit.restingOffsetMm
-    const stiffness = 0.22 + 0.5 * asset.fit.stiffness
-    const allowedMm = 5 + asset.links.widthMm
-    for (const p of this.local) {
+  _solveAxial(asset, tune, h) {
+    const rest = this._rest
+    const hold = 1 - Math.exp(-tune.axialHold * h)
+    const allowed = 5 + asset.links.widthMm
+    const bandPull = 1 - Math.exp(-(8 + 12 * asset.fit.stiffness) * h)
+    for (const p of this.sim) {
       const along = p.y - rest
-      const excess = Math.abs(along) - allowedMm
-      if (excess > 0) p.y -= Math.sign(along) * excess * stiffness
+      p.y -= along * hold
+      const excess = Math.abs(along) - allowed
+      if (excess > 0) p.y -= Math.sign(along) * excess * bandPull
     }
   }
 
-  /**
-   * The wall planes (walls.js): in arm space, simply y = near and y = far.
-   * The chain moves freely between them; no link may pass either.
-   * Constraint only: nothing is drawn, nothing occludes.
-   */
+  /** Keep stacked bracelets from occupying the same stretch of arm. */
+  _solveNeighbour(stationY, asset) {
+    const minDist = asset.stockRadiusMm * 2 + 0.4
+    for (const p of this.sim) {
+      const d = p.y - stationY
+      if (Math.abs(d) < minDist) p.y = stationY + Math.sign(d || 1) * minDist
+    }
+  }
+
+  /** Push links (and charms) out of the arm; how hard is the friction budget. */
+  _solveArm(asset, twin) {
+    const pad = asset.stockRadiusMm + asset.fit.clearanceMm * 0.3
+    for (let i = 0; i < this.sim.length; i++) {
+      const p = this.sim[i]
+      if (!armContact(p, twin, 0, pad, this._prev[i], _contact, false, this._squeeze)) continue
+      this._contactDepth[i] += _contact.depth
+      this.maxContact = Math.max(this.maxContact, Math.min(1, _contact.depth / pad))
+      p.x = _contact.x
+      p.z = _contact.z
+    }
+    for (const charm of this.charms) {
+      if (armContact(charm.x, twin, 0, charm.spec.sizeMm * 0.4, charm.prev, _contact, false, this._squeeze)) {
+        charm.x.x = _contact.x
+        charm.x.z = _contact.z
+      }
+    }
+  }
+
+  /** The wall planes (walls.js): in this frame simply y = near and y = far. */
   _solveWalls(asset) {
     const pad = asset.stockRadiusMm
     const near = WALL_NEAR_MM + pad
     const far = WALL_FAR_MM - pad
-    for (const p of this.local) {
+    for (const p of this.sim) {
       if (p.y < near) p.y = near
       else if (p.y > far) p.y = far
     }
   }
 
   /**
-   * Push links out of the arm: in arm space a fixed elliptical tube round +Y.
-   *
-   * A link found deep inside was knocked through rather than having slid in,
-   * so it goes back out along the direction it came from (its previous
-   * position), which keeps the loop threaded round the arm.
+   * Skin friction (position-based Coulomb friction, Macklin et al. 2014), for
+   * the links the arm pushed on this step: their slip over the skin is
+   * cancelled while it is within the static cone of that push, and reduced by
+   * the kinetic one beyond it. A uniform loop round an arm is in neutral
+   * equilibrium at any rotation; without this, the tiniest bias turns it.
    */
-  _solveWristCollision(asset, twin) {
-    const pad = asset.stockRadiusMm + asset.fit.clearanceMm * 0.3
-    const section = _section
-    for (let i = 0; i < this.local.length; i++) {
-      const p = this.local[i]
-      twin.sectionAt(clamp(p.y, TUBE_MIN_S, TUBE_MAX_S), section)
-      const A = section.a + pad
-      const B = section.b + pad
-      const f = (p.x * p.x) / (A * A) + (p.z * p.z) / (B * B)
-      if (f >= 1) continue
-      let u = p.x
-      let v = p.z
-      let g = f
-      if (f < TUNNEL_F) {
-        const q = this.prevLocal[i]
-        const fq = (q.x * q.x) / (A * A) + (q.z * q.z) / (B * B)
-        if (fq > 1e-6) {
-          u = q.x
-          v = q.z
-          g = fq
-        }
-      }
-      if (g < 1e-9) {
-        // Dead centre with no history: any outward direction will do.
-        u = A
-        v = 0
-        g = 1
-      }
-      const k = 1 / Math.sqrt(g)
-      const px = p.x
-      const pz = p.z
-      p.x = u * k
-      p.z = v * k
-      // How hard the skin pushed back this substep: the friction budget.
-      this._contactDepth[i] += Math.hypot(p.x - px, p.z - pz)
-      this.maxContact = Math.max(this.maxContact, clamp(1 - f, 0, 1))
-    }
-  }
-
-  /**
-   * Skin friction (position-based Coulomb friction, as in Macklin et al.,
-   * "Unified Particle Physics", 2014), once per substep for the links that
-   * touched the arm in it.
-   *
-   * The normal push the collision applied is the contact's "normal force";
-   * the link's slip over the skin this substep is cancelled outright while it
-   * is within MU_STATIC of that (the link sticks), and reduced by MU_KINETIC
-   * of it once it breaks free. A uniform loop round an arm is in neutral
-   * equilibrium at ANY rotation, so without this nothing stops the tiniest
-   * numerical bias turning it round the wrist; with it a resting bracelet
-   * rests, and only a real push (gravity on a steep slope, the arm's own
-   * motion) makes it slide.
-   */
-  _solveFriction(asset, twin) {
-    const pad = asset.stockRadiusMm + asset.fit.clearanceMm * 0.3
-    const section = _section
-    for (let i = 0; i < this.local.length; i++) {
+  _solveFriction(tune) {
+    for (let i = 0; i < this.sim.length; i++) {
       const depth = this._contactDepth[i]
       if (depth <= 0) continue
-      const p = this.local[i]
-      twin.sectionAt(clamp(p.y, TUBE_MIN_S, TUBE_MAX_S), section)
-      const A = section.a + pad
-      const B = section.b + pad
-      // Outward surface normal of the ellipse at the link.
-      _n.set(p.x / (A * A), 0, p.z / (B * B))
-      if (_n.lengthSq() < 1e-12) continue
-      _n.normalize()
-      // Slip this substep, less its normal part.
-      _d.subVectors(p, this.prevLocal[i])
-      _d.addScaledVector(_n, -_d.dot(_n))
+      const p = this.sim[i]
+      // Outward direction from the arm's axis stands in for the normal.
+      const len = Math.hypot(p.x, p.z)
+      if (len < 1e-6) continue
+      const nx = p.x / len
+      const nz = p.z / len
+      _d.subVectors(p, this._prev[i])
+      const dn = _d.x * nx + _d.z * nz
+      _d.x -= dn * nx
+      _d.z -= dn * nz
       const slip = _d.length()
       if (slip < 1e-9) continue
-      if (slip <= MU_STATIC * depth) p.sub(_d)
-      else p.addScaledVector(_d, -Math.min(1, (MU_KINETIC * depth) / slip))
-    }
-  }
-
-  /** Keep stacked bracelets from occupying the same space (arm space). */
-  _solveNeighbour(nb, asset) {
-    const minDist = asset.stockRadiusMm + nb.stockRadiusMm + 0.4
-    for (const p of this.local) {
-      _d.subVectors(p, nb.center)
-      const along = _d.dot(nb.axis)
-      if (Math.abs(along) >= minDist) continue
-      // Only separate along the arm; a stack sits side by side, not nested.
-      const radial = _tmp.copy(_d).addScaledVector(nb.axis, -along).length()
-      if (radial > Math.max(nb.radiusA, nb.radiusB) + minDist * 2) continue
-      const push = (minDist - Math.abs(along)) * (along >= 0 ? 1 : -1)
-      p.addScaledVector(nb.axis, push * 0.5)
-    }
-  }
-
-  /** Charms hang from their link and swing with the arm (arm space). */
-  _solveCharms(h, twin) {
-    const drag = 0.94
-    const spin = this._w.lengthSq() > 0 || this._alpha.lengthSq() > 0
-    const section = _section
-    for (const charm of this.charms) {
-      const anchor = this.local[charm.index]
-      const p = charm.local
-      _v.subVectors(p, charm.prevLocal)
-      this._field(p, _v, h, spin, _acc)
-      charm.prevLocal.copy(p)
-      p.addScaledVector(_v, drag).addScaledVector(_acc, h * h)
-
-      // Rigid pivot distance to the anchor link.
-      _d.subVectors(p, anchor)
-      const len = _d.length()
-      if (len > 1e-5) p.copy(anchor).addScaledVector(_d, charm.spec.dropMm / len)
-
-      // Charms should not sink into the arm either.
-      twin.sectionAt(clamp(p.y, TUBE_MIN_S, TUBE_MAX_S), section)
-      const A = section.a + charm.spec.sizeMm * 0.4
-      const B = section.b + charm.spec.sizeMm * 0.4
-      const f = (p.x * p.x) / (A * A) + (p.z * p.z) / (B * B)
-      if (f < 1) {
-        const k = 1 / Math.sqrt(Math.max(1e-9, f))
-        p.x *= k
-        p.z *= k
-      }
+      if (slip <= tune.frictionStatic * depth) p.sub(_d)
+      else p.addScaledVector(_d, -Math.min(1, (tune.frictionKinetic * depth) / slip))
     }
   }
 
   /**
-   * How many times the loop goes round the arm's axis (arm space, measured
-   * on the normalised ellipse so a flattened arm counts the same). 1 or -1
-   * means the bracelet is on; 0 means it has come off.
+   * How many times the loop goes round the arm's axis, on the normalised
+   * ellipse. 1 or -1: on the arm; 0: off it.
    */
   _winding(fit) {
-    const pts = this.local
+    const pts = this.sim
     const n = pts.length
     if (n < 3) return 1
     const A = Math.max(1, fit.ringA)
@@ -487,24 +514,23 @@ export class XPBDChainSolver {
     return Math.round(total / (2 * Math.PI))
   }
 
-  /** World-space copies, for anything outside the renderer that wants them. */
+  // --------------------------------------------------------------- publish
+
+  /**
+   * Interpolate between the last two steps to the display time, express the
+   * result in the arm frame (the renderer's matrix) and in world space.
+   */
   _publish() {
-    for (let i = 0; i < this.local.length; i++) {
-      this.particles[i].copy(this.local[i]).applyMatrix4(this.frame)
+    const alpha = this._acc / STEP_S
+    for (let i = 0; i < this.sim.length; i++) {
+      const l = this.local[i].copy(this._prev[i]).lerp(this.sim[i], alpha)
+      this.jframe.toArm(l)
+      this.particles[i].copy(l).applyMatrix4(this.frame)
     }
-    for (const charm of this.charms) charm.position.copy(charm.local).applyMatrix4(this.frame)
-  }
-}
-
-const _section = { a: 0, b: 0 }
-
-/** A world-space stack neighbour, re-expressed in arm space. */
-function toArmNeighbour(nb, origin, toArm) {
-  return {
-    center: nb.center.clone().sub(origin).applyQuaternion(toArm),
-    axis: nb.axis.clone().applyQuaternion(toArm),
-    radiusA: nb.radiusA,
-    radiusB: nb.radiusB,
-    stockRadiusMm: nb.stockRadiusMm,
+    for (const charm of this.charms) {
+      charm.local.copy(charm.prev).lerp(charm.x, alpha)
+      this.jframe.toArm(charm.local)
+      charm.position.copy(charm.local).applyMatrix4(this.frame)
+    }
   }
 }

@@ -52,13 +52,11 @@ const TARGETS = {
 
     <div class="toggles">
       <label v-for="(label, key) in {
-        contactShadows: 'Contact shadows',
         lightEstimation: 'Camera light estimation',
         showOccluder: 'Show wrist occluder',
         showWristFrame: 'Show wrist frame (rotation)',
         showSegmentation: 'Show segmentation mask',
         showWalls: 'Show invisible walls',
-        realisticPhysics: 'Realistic bracelet physics (slide, sag, tilt)',
       }" :key="key" class="toggle">
         <input
           type="checkbox"
@@ -66,6 +64,19 @@ const TARGETS = {
           @change="$emit('update:option', { key, value: $event.target.checked })"
         />
         <span>{{ label }}</span>
+      </label>
+
+      <label class="picker" title="How much of the arm's motion reaches the jewellery, and how quickly it dies away. Both ends are real physics.">
+        <span>Bracelet physics</span>
+        <span class="slider">
+          <em>calm</em>
+          <input
+            type="range" min="0" max="1" step="0.05"
+            :value="options.physicsLiveliness"
+            @input="$emit('update:option', { key: 'physicsLiveliness', value: Number($event.target.value) })"
+          />
+          <em>lively</em>
+        </span>
       </label>
 
       <label class="picker">
@@ -211,6 +222,9 @@ const TARGETS = {
   display: flex; align-items: center; justify-content: space-between;
   gap: 8px; font-size: 12px; color: #a8aeb6; cursor: pointer; margin-top: 2px;
 }
+.slider { flex: 1; max-width: 172px; display: flex; align-items: center; gap: 6px; }
+.slider em { font-style: normal; font-size: 10.5px; color: #6f757d; }
+.slider input { flex: 1; min-width: 0; accent-color: #c79a51; }
 .picker select {
   flex: 1; max-width: 172px;
   padding: 5px 7px; border-radius: 7px;

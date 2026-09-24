@@ -12,8 +12,155 @@ npm run dev      # open the URL, allow camera
 npm run verify   # headless checks of the geometry, fit and physics maths
 npm run bench    # replay REAL recorded clips (fixtures/) through the wrist pipeline
 npm run bench:jewelry  # the same clips through tracker + physics: what the USER sees
+npm run scorecard      # every quality goal on every clip; --save / --compare runs
 npm run build
 ```
+
+### Recording test clips (dev only)
+
+`npm run dev`, start the camera, then **Record test clips** in the header. A guided script
+(hold still, slow turn, wrist bend, forearm swing, closer/further, shake-then-hold, side-on,
+sleeve, free try-on) coaches the framing with arrows, counts down, and keeps a take only once
+it contains the movement asked for; a take that loses the hand or the framing is retried.
+Each take is written by the dev server to `fixtures/<scenario>-<MMDD-HHMMSS>/`:
+
+| file | |
+|---|---|
+| `recording.v1.bin` | the usual VTO1 clip: raw frame (JPEG), image + world landmarks, handedness |
+| `armmask.bin` | the live pipeline's own soft arm mask per frame; the bench replays it exactly |
+| `capture.json` | scenario, lens, capture timestamps, per-frame framing flags, camera fps and timings |
+
+`npm run bench -- <clip>` / `npm run bench:jewelry -- <clip>` pick them up like any other clip.
+A **fps** chip flags takes the machine or the camera could not deliver at full rate (webcams
+drop to 15 fps in dim light). Clips are video of a real person: they stay out of git.
+
+## Premium pass: measured, then changed
+
+`npm run scorecard` replays every clip in `fixtures/` through the live pipeline (observer,
+tracker, fit, physics) on a steady render clock and reports each quality goal in one table;
+`--save` / `--compare` keep and diff runs, `--hz` changes the render rate. Numbers below are
+all clips pooled, old code vs. this pass, p95 unless noted.
+
+| goal | before | after | what did it |
+|---|---|---|---|
+| roll twitch (bracelet turning round the arm), deg/frame | 7.5 | **4.9** | roll filtered on its own (below) |
+| forearm-direction shake, deg/frame | 2.5 | 2.2 | the axis filter no longer sees roll noise as motion |
+| tennis / charm rim shake on screen, px | 40 / 41 | **20 / 20** | physics rewrite |
+| tennis / charm jumps along the arm, per min | 53 / 83 | **10 / 8** | sleeve filter, physics rewrite |
+| chains, 30 vs 60 vs 120 Hz display, mm apart | 16 | 7-8 | fixed-step physics |
+| hand detections per second, live, 30 fps camera | 18 | **~30** | hand first in the frame budget |
+| one hand's wrist over 9 sessions, mm | 119-180 | **138-162** | palm-size prior (below) |
+| screen shake, size pumping, lag | 17 px, 3.9 %, 11 px | 17 px, **3.6 %**, 11 px | arm ruler spike gate (below) |
+
+**Roll is the noisiest thing we track, and is now filtered as such.** The orientation is
+split into the forearm's direction and its roll about it (`wrist/OrientationFilter.js`): the
+direction keeps its 1€ filter; the roll gets a constant-velocity Kalman filter
+(`core/KalmanCV.js`) tuned on the recordings against a roll-lag measure. Roll lag p90 went
+3.5° → 5.2°: the price of the calmer roll, and roll is the least visible degree of freedom of
+a round piece.
+
+**Physics is real now** (`physics/`). Both solvers step at a fixed rate (480 / 600 Hz) and
+interpolate for display, in a `JewelleryFrame`: the arm's frame with its twist followed
+through a soft spring, so a real pronation reaches the piece and a tracker twitch does not.
+
+- *Bangle / cuff* (`RigidSolver`): an XPBD rigid body (Müller et al. 2020) - mass, contact
+  of 24 points round its inner edge with the tapered arm tube, positional static and kinetic
+  skin friction, a soft bounce, the wall planes, a tasteful tilt limit, sleep when it and the
+  arm are at rest. A loose bangle really rests on the top of the wrist, slides when the arm
+  tilts past what friction holds, cocks on a slope and jams on the widening arm. A cuff
+  springs onto the wrist.
+- *Chains* (`XPBDChainSolver`): small steps, one constraint pass each; inextensible links;
+  bending about the loop's own rest curve (a tennis band stays flat along the arm, a rope
+  drapes); charms are two-way pendulums that pull on their link.
+- *Skin gives*: where a piece is smaller than the arm there (a wrist over-measured, or a
+  piece genuinely too tight) the arm is squeezed to fit rather than fought - fighting it once
+  launched a bangle off the arm at 178 rad/s.
+- One **liveliness** knob (Engine panel, calm ↔ lively, `physics/tuning.js`) replaces the
+  stable/realistic switch: how much of the arm's motion reaches the piece and how fast it
+  dies away. Calm (0.4) is the default; charms still swing ~0.8 s after the arm stops.
+
+**Things that jumped, and why they no longer do.** The arm profiler's sleeve flickered frame
+to frame on a still arm (none, 41, 32, none, 25 mm), and the fit moved the bracelet's resting
+station with it - a chain was yanked 45 mm in one frame. A sleeve is now believed only once
+it persists (`SleeveFilter`), the station glides, and the wrist shape the tube and physics
+see glides too while it is still being measured (at most 10 mm/s).
+
+**Segment once, then only track? Measured.** Replayed on the in-app recordings, against
+where the per-frame segmentation says the arm is (arm direction error, how far the model sits
+off the arm's centre in % of its width, width error; p50 / p90):
+
+| after the wrist is measured | direction | off centre | width |
+|---|---|---|---|
+| network as recorded (~every frame, refined per frame) | 0.5° / 3.2° | 1 / 6 % | 2 / 6 % |
+| network every ~150 ms, refinement tracking in between | 0.7° / 3.4° | 1 / 6 % | 3 / 7 % |
+| network every ~300 ms | 0.8° / 4.5° | 2 / 7 % | 3 / 9 % |
+| network every ~1 s | 1.2° / 9.4° | 2 / 11 % | 4 / 15 % |
+| network once, then colour-and-edge tracking only | 2.1° / 22° | 4 / 47 % | 6 / 23 % |
+| network once, then hand landmarks only | 8° / 26° | 9 / 64 % | 8 / 19 % |
+
+The network is the anchor: tracked by colour alone the arm drifts (a slightly wrong prediction
+teaches the colour model wrong labels), and from landmarks alone a bent wrist cannot be told
+from a moving forearm. But it need not run every frame, so it now runs at 12 Hz while the
+wrist is being measured and 6 Hz while a measured wrist is tracked, back to 12 Hz while the
+arm moves fast or its silhouette is weak. The cheap per-frame refinement (~3 ms) always runs.
+
+**A shake reaches the bracelet.** During the most vigorous second of each recording the
+physics used to feel 0-13 % of the tracked arm's acceleration (p90), and nothing at all half
+the time: the filter, dead zones and gain that keep tracking noise off a still piece kept a
+real shake off it too. `ArmInertia` is now motion-adaptive - while the arm clearly moves
+(> 150-500 mm/s, where noise never goes) it opens up (6-9 Hz, a sixth of the dead zones, full
+gain) - and felt 30-40 % on the same seconds; charms travel 4x further in a shake, a loose
+bangle rattles and slides. On a still arm nothing changed (rest speeds identical). What it
+cannot fix: in dim light the camera runs at 12-15 fps and MediaPipe loses the hand on about
+a third of the frames of a fast shake - no tracking reproduces a shake it cannot see.
+
+**Tried and dropped, because the recordings said no:**
+
+- *Narrowing the per-frame arm search once the shape locks* (expecting the locked width,
+  skipping its fan of alternative directions): on the still clip the arm's size pumped
+  1.4 % → 8.8 %. The locked width can be off, and the fan is what rescues weak frames.
+- *A Kalman filter fusing palm and arm distance*: less lag, but twice the size pumping of the
+  1€ filter at rest. Pumping is what shows.
+
+**The bracelet is its real size on the arm.** The arm tube always matches the arm on screen
+(the arm ruler sees to that), but its millimetres - and so how big a real 180 mm bangle looks
+on it - come from MediaPipe's palm scale. That scale is a learned guess: one hand, one camera,
+one day read a wrist-to-knuckle span of 68-104 mm over nine recorded sessions, the wrist came
+out 119-180 mm, and in the 119 mm session the bangle was drawn 1.6x as wide as the arm. The
+wrist's shape *relative to the palm* was steady (width ~0.62 palm); only the scale wandered.
+
+- The palm is now MediaPipe's reading combined with what adult palms are (`palmFromScale`:
+  82 mm; one session's reading varies twice as much as adult palms do, so it carries ~18 % of
+  the weight). Same hand, nine sessions: 138-162 mm.
+- This was tried once before and dropped for costing shake. The shake was one broken arm
+  outline (68 px wide against the arm's 144 px) that the new scale happened to let through:
+  the arm ruler took it as the arm stepping 40 % further away. Ruler readings that jump more
+  than 15 % in one outline now wait for the next outline to agree (`RULER_GATE`); with that
+  the still recording is calmer than before (shake 2.5 → 2.2 px, size pumping 1.7 → 1.0 %).
+- The device **remembers** the wrist (`localStorage`, `mmto.wrist.v2`): MediaPipe's raw palm
+  reading averaged over up to 5 sessions, and the wrist's shape as a ratio of the palm. Each
+  session adds its reading, so the prior's weight falls as sessions average out MediaPipe's
+  noise. v1 memories (millimetres at MediaPipe's scale) are not carried over. *Re-measure*
+  forgets it.
+- A tape-measured wrist (Fit panel) overrides all of it and is exact. It could not freeze
+  before - the freeze test compared the taped width with the camera's readings - and now does.
+- **No default wrist in production.** Until this session has measured the wrist (or the user
+  typed a size, which is not kept between sessions) no size is shown, no fit verdict is
+  given and nothing is worn: the solver's placeholder shape is nobody's wrist. Pieces are
+  seated fresh on the first real size - seated on the placeholder, a cuff smaller than the
+  real wrist was thrown off the arm when the arm grew 20 % around it. (Seating now also
+  squeezes the arm to fit a piece smaller than it, as the running physics always did.)
+- The bangle's metal was drawn centred on its inner edge, so half of it sank into the skin
+  wherever it touched the arm; it now starts at the inner edge the physics holds on the arm.
+
+A rigid bangle has to pass over the hand, so on the wrist it is always visibly larger than
+the arm - a 180 mm bangle on a 150 mm wrist hangs about 1.3x the arm's width. Chains hug it.
+
+**Live-app fixes the benches cannot see:** frames are detected with
+`requestVideoFrameCallback` and stamped with the camera's capture time (~4 % of frames used
+to be read under the previous frame's timestamp); weak tracking keeps the piece solid instead
+of fading it to 65 % (a translucent jewel reads as a glitch); a hint asks for more light when
+the camera drops below 20 fps (webcams halve their frame rate in dim light).
 
 ---
 
@@ -39,7 +186,7 @@ CAMERA
  FIT      PHYSICS     OCCLUSION
    │         │            │
    └─────────┼────────────┘
-         RENDER           PBR + contact shadow + camera-estimated lighting
+         RENDER           PBR + occlusion + camera-estimated lighting
 ```
 
 ## What the twin actually is
@@ -118,7 +265,8 @@ palm flex moves the bracelet 1.5° (it used to move it 45°), deviation 0.6°, a
 swing is followed to within 2°, a 70° pronation is followed to within 0.3°, all with and
 without detector-grade landmark noise.
 
-Rotation is smoothed with a 1€ filter on SO(3) (`OneEuroQuat`), and the pose is predicted to
+Rotation is smoothed in two parts (`OrientationFilter`: 1€ on the forearm axis, a Kalman
+filter on the roll about it), and the pose is predicted to
 the capture time of the **video frame on screen**, not to wall-clock time. Predicting to
 `now` put the bracelet ahead of an arm still showing the previous camera frame.
 
@@ -214,10 +362,9 @@ recorded clips, candidate pipelines run in real Chrome, scored on axis angle and
   outline and the occluder span all of it, whatever length of forearm this frame's mask
   happened to show (it swung ~5-20 cm). Before, the occluder was cut back to the mask's
   reach - to nothing on some side-on frames - and the bracelet ended up past its end.
-- **Stable bracelet physics by default**: no sliding along the arm, sag <= 1.5 mm, tilt
-  <= 3 deg, slow settling. *Realistic bracelet physics* (Engine panel) restores full
-  gravity slide/sag/tilt within the walls. On the recordings the bangle's motion relative
-  to the arm dropped ~20-40 % (p90) and its turning ~3x.
+- **Bracelet physics** is real rigid-body and XPBD physics with one *liveliness* setting
+  (see *Premium pass* above); it replaced a stable mode that capped sag at 1.5 mm and tilt
+  at 3 deg.
 - **Invisible walls: two planes at the ends of the arm tube** (`physics/walls.js`, 6 mm
   and 84 mm up the forearm). The bracelet moves freely between them - it slides along the
   arm in both physics modes - and can never pass either, so it cannot leave the tube.
@@ -226,7 +373,8 @@ recorded clips, candidate pipelines run in real Chrome, scored on axis angle and
   palm.
 - **Loose-ring tilt fixed.** Gravity tilt was largest with the forearm vertical, exactly
   where its axis (forearm x gravity) is undefined, so the ring tipped to an arbitrary
-  side. It now fades out toward vertical and is capped at 8 deg.
+  side. With contact physics a ring round a vertical arm lands on the widening arm and
+  hangs level to within a few degrees; tilt is capped by liveliness (4-10 deg).
 - **Everything on the arm lives in arm space** (`WristDigitalTwin.frameMatrix`). The
   occluder tube is built once in the arm's own frame and only its matrix follows the pose;
   chain physics runs in that frame too, and the links are drawn under the same matrix. Pose
@@ -310,16 +458,14 @@ when the user enters a tape measurement. The UI shows both.
 
 | Category | Solver | Behaviour |
 |---|---|---|
-| `rigid_bangle` | `RigidSolver` | keeps its size; drops inside its slack, tilts, slides along the forearm |
-| `open_cuff` | `RigidSolver` | same, plus opening bearing, no sliding |
-| `tennis_bracelet` | `XPBDChainSolver` | stiff links, holds its arc |
-| `chain` | `XPBDChainSolver` | loose links, sags and slides |
-| `charm_bracelet` | `XPBDChainSolver` | loose links plus charms on rigid pivots that swing |
+| `rigid_bangle` | `RigidSolver` | XPBD rigid body: rests on the wrist, knocks, slides, cocks, settles |
+| `open_cuff` | `RigidSolver` | the same body, sprung onto the wrist, opening at its bearing |
+| `tennis_bracelet` | `XPBDChainSolver` | inextensible links, holds its arc, band stays flat along the arm |
+| `chain` | `XPBDChainSolver` | inextensible links that drape both ways, sags and slides |
+| `charm_bracelet` | `XPBDChainSolver` | loose links plus charms as pendulums that pull on their link |
 
-The drop of a rigid piece is solved exactly: the largest displacement along gravity that
-still keeps the wrist ellipse inside the ring ellipse. Chains are particles with distance,
-bend, axial and wrist-collision constraints; distance is re-solved after collision so links
-do not visibly stretch.
+Both step at a fixed rate in the `JewelleryFrame` and collide with the tapered arm tube;
+skin friction holds a piece where it comes to rest (see *Premium pass*).
 
 **Stacking is native.** Each piece gets its own band of forearm and chains collide with
 their neighbours, so three bracelets sit side by side instead of intersecting.
@@ -347,13 +493,12 @@ unchanged, because both read the same numbers the procedural mesh does.
 - **Occlusion** — a lofted mesh of the actual twin writes depth, then is trimmed per-pixel
   to the segmentation silhouette. A chain passing behind the arm is hidden by real geometry,
   not by an invisible cylinder. Outside the mask's region of interest the twin geometry alone decides.
-- **Contact shadow** — jewellery depth is rendered from directly above the wrist and the
-  skin darkens where metal hovers within a few millimetres. Without it, gold floats.
 - **Lighting** — key direction, key intensity, ambient level and colour temperature are
   estimated from the camera frame, plus a low-resolution local environment that includes a
   blurred crop of the wearer's own wrist, so the metal picks up warm skin bounce.
-- **Confidence-aware rendering** — `EXCELLENT / GOOD / DEGRADED / LOST` with hysteresis,
-  driving a continuous fade. Never a hard `visible = false`.
+- **Confidence-aware rendering** — `EXCELLENT / GOOD / DEGRADED / LOST` with hysteresis.
+  The piece fades in and out, but is never drawn see-through while tracked: weak tracking
+  shows a hint, not a ghost.
 
 ## Temporal quality is a first-class metric
 
@@ -372,22 +517,26 @@ These are engineering targets for this product, not an external standard.
 
 ```
 src/vto/
-  core/          1€ filter, ellipse fit, tracking state machine
+  core/          1€ and Kalman filters, ellipse fit, tracking state machine
   camera/        capture + a single pinhole model shared by perception and renderer
   perception/    hand landmarks; wrist-crop arm segmentation + per-frame refinement
   wrist/         observer, multi-view geometry solver, temporal twin
   fit/           product mm vs. measured wrist
-  physics/       rigid + XPBD solvers (chains in arm space), arm inertia, wall planes
-  render/        materials, procedural jewellery, occluder, contact shadow, lighting
+  physics/       XPBD rigid + chain solvers, jewellery frame, arm tube, inertia, liveliness
+  capture/       guided recorder of test clips (dev only)
+  render/        materials, procedural jewellery, occluder, lighting
   assets/        asset schema + demo catalogue
   VTOEngine.js   the per-frame pipeline
 ```
 
 ## Known limits
 
-- **Sizing accuracy** is bounded by MediaPipe's world landmarks. Relative geometry is good;
-  absolute millimetres carry real error. This is surfaced as a separate confidence rather
-  than hidden, and the manual wrist input overrides it.
+- **Sizing accuracy** is bounded by monocular scale. Relative geometry is good; absolute
+  millimetres rest on MediaPipe's palm scale (±14 % between sessions of the same hand on the
+  recordings) pulled toward an average adult palm, so an individual's wrist is still an
+  estimate - about ±6-8 %, more for hands far from average. This is surfaced as a separate
+  confidence rather than hidden; the device remembers a measured wrist, and the manual wrist
+  input overrides it.
 - **Occlusion** is twin geometry trimmed by a segmentation mask, not per-pixel metric depth.
   Fingers crossing in front of the wrist are handled only as far as the mask allows. A
   learned depth model (e.g. Depth Anything V2 Small, Apache-2.0) or ARCore/ARKit hardware
@@ -397,8 +546,10 @@ src/vto/
 - Lens angle is a 72° diagonal default unless the browser reports one or a per-device
   value was stored (`CameraModel.rememberLens`). Focal length cancels out of the metric
   wrist measurement but affects 3D depth and perspective.
-- The rope chain — the loosest asset — still shows up to ~11 % worst-case link stretch under
-  heavy sag. Within tolerance, but it is the weakest number in `npm run verify`.
+- Chains show up to ~10 % worst-case link stretch while pressed against the arm under heavy
+  synthetic jitter (`npm run verify`); at rest they hold their length.
+- **Perception runs at the camera's frame rate**, and a webcam in dim light delivers 10-15 fps
+  (seen on real sessions): no tracking looks smooth then. The app says so.
 - **A palm tilt held perfectly still** is genuinely ambiguous from one camera without the
   arm silhouette: nothing distinguishes "wrist bent" from "arm tilted toward the camera".
   The estimate relaxes toward the hand over ~4 s (a 45° flex held for 2 s shows ~18°).

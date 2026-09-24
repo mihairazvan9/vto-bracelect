@@ -16,8 +16,29 @@ const _ray = new THREE.Vector3()
  * BEFORE it is differentiated twice into an acceleration.
  */
 const BANDWIDTH_HZ = 3.2
-const OMEGA_N = 2 * Math.PI * BANDWIDTH_HZ
 const SUBSTEP_S = 1 / 240
+
+/**
+ * MOTION-ADAPTIVE: the filter, dead zones and gain above exist to keep the
+ * detector's noise off a piece on a still arm - and on the recordings they also
+ * kept a real shake off it: during the most vigorous second of each clip the
+ * physics felt 0-13 % of the tracked arm's acceleration (p90), and nothing at
+ * all half the time. Noise and a shake share frequencies but not size: a held
+ * arm's tracked wrist moves < 50 mm/s, a shake 500-2000. So while the arm is
+ * clearly moving, the follower opens up (to profile.shakeHz), the dead zones
+ * shrink and the gain rises (to profile.shakeGain); on a still arm nothing
+ * changes. The level rises fast (a shake's first swing must get through) and
+ * falls slowly (it must stay open through the shake's reversals, where the
+ * speed passes through zero).
+ */
+const MOTION_START_MM_S = 150
+const MOTION_FULL_MM_S = 500
+const MOTION_START_RAD_S = 1.2
+const MOTION_FULL_RAD_S = 4
+const MOTION_ATTACK_S = 0.05
+const MOTION_RELEASE_S = 0.4
+/** Dead zones at full motion, as a share of the still-arm ones. */
+const OPEN_DEADZONE = 0.15
 
 /**
  * Soft dead zones: below these the arm is, for jewellery purposes, still.
@@ -71,10 +92,13 @@ export class ArmInertia {
     this.angularAcc = new THREE.Vector3()
 
     this.initialised = false
+    /** 0 = arm still (noise rejection), 1 = arm clearly moving (feel it all). */
+    this.motion = 0
   }
 
   reset() {
     this.initialised = false
+    this.motion = 0
     this.linearAcc.set(0, 0, 0)
     this.omega.set(0, 0, 0)
     this.angularAcc.set(0, 0, 0)
@@ -97,8 +121,11 @@ export class ArmInertia {
     // 3 Hz filter at any render rate, and unconditionally stable.
     const steps = Math.max(1, Math.ceil(dt / SUBSTEP_S))
     const h = dt / steps
-    const k = OMEGA_N * OMEGA_N
-    const c = 2 * OMEGA_N
+    const m = this._motionLevel(dt)
+    const hz = BANDWIDTH_HZ + ((profile.shakeHz ?? BANDWIDTH_HZ) - BANDWIDTH_HZ) * m
+    const wn = 2 * Math.PI * hz
+    const k = wn * wn
+    const c = 2 * wn
     _a.set(0, 0, 0)
     _alpha.set(0, 0, 0)
     for (let i = 0; i < steps; i++) {
@@ -125,10 +152,25 @@ export class ArmInertia {
       _a.addScaledVector(_ray, -along * (1 - DEPTH_TRUST))
     }
 
-    shape(this.linearAcc.copy(_a), profile.gain, LINEAR_DEADZONE, profile.maxLinear)
-    shape(this.omega.copy(this.angularVelocity), profile.gain, ANGULAR_VEL_DEADZONE, profile.maxAngularVel)
-    shape(this.angularAcc.copy(_alpha), profile.gain, ANGULAR_ACC_DEADZONE, profile.maxAngularAcc)
+    const gain = profile.gain + (Math.max(profile.gain, profile.shakeGain ?? profile.gain) - profile.gain) * m
+    const dead = 1 - (1 - OPEN_DEADZONE) * m
+    const maxLinear = profile.maxLinear + (Math.max(profile.maxLinear, profile.shakeMaxLinear ?? profile.maxLinear) - profile.maxLinear) * m
+    shape(this.linearAcc.copy(_a), gain, LINEAR_DEADZONE * dead, maxLinear)
+    shape(this.omega.copy(this.angularVelocity), gain, ANGULAR_VEL_DEADZONE * dead, profile.maxAngularVel)
+    shape(this.angularAcc.copy(_alpha), gain, ANGULAR_ACC_DEADZONE * dead, profile.maxAngularAcc)
     return this
+  }
+
+  /** How clearly the arm is moving, 0..1, from the follower's own (filtered) speed. */
+  _motionLevel(dt) {
+    const v = this.velocity.length()
+    const w = this.angularVelocity.length()
+    const lin = Math.min(1, Math.max(0, (v - MOTION_START_MM_S) / (MOTION_FULL_MM_S - MOTION_START_MM_S)))
+    const ang = Math.min(1, Math.max(0, (w - MOTION_START_RAD_S) / (MOTION_FULL_RAD_S - MOTION_START_RAD_S)))
+    const target = Math.max(lin, ang)
+    const tau = target > this.motion ? MOTION_ATTACK_S : MOTION_RELEASE_S
+    this.motion += (target - this.motion) * (1 - Math.exp(-dt / tau))
+    return this.motion
   }
 
   _jumped(pos, quat) {

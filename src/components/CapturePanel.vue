@@ -41,10 +41,10 @@ function stateOf(view, s) {
           </div>
         </div>
         <button
-          v-if="view.results[s.id] && (!view.active || view.status === 'done')"
+          v-if="!view.active || view.status === 'done'"
           class="link"
           @click="$emit('redo', s.id)"
-        >Redo</button>
+        >{{ view.results[s.id] ? 'Redo' : 'Record' }}</button>
       </li>
     </ol>
 

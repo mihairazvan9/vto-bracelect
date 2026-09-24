@@ -134,6 +134,71 @@ function wrapDeg(a) {
   return ((((a + 180) % 360) + 360) % 360) - 180
 }
 
+/** Sleeve evidence is judged over this many recent observations... */
+const SLEEVE_WINDOW = 12
+/** ...and only those this recent, ms. */
+const SLEEVE_WINDOW_MS = 800
+/** Share of recent observations that must see a sleeve before it is believed... */
+const SLEEVE_ENTER = 0.6
+/** ...and the share below which it is let go again. */
+const SLEEVE_EXIT = 0.25
+/** Fastest a believed sleeve edge moves along the arm, mm/s. */
+const SLEEVE_SLEW_MM_S = 40
+
+/**
+ * Where a sleeve covers the forearm, steadied over time.
+ *
+ * The arm profiler reports a sleeve per frame, and on the recordings that
+ * report flickered - no sleeve, 41 mm, 32 mm, none, 25 mm on consecutive
+ * frames of a still arm (a shadowed or hairy stretch reads as the arm ending).
+ * The fit follows the sleeve with the bracelet's resting station, so every
+ * flicker yanked a chain up to 45 mm along the arm in one frame. A real
+ * sleeve is there frame after frame: it is believed once most recent frames
+ * see it, let go once few do, and its edge glides rather than jumps.
+ */
+export class SleeveFilter {
+  constructor() {
+    this.readings = []
+    this.active = false
+    this.value = Infinity
+    this._t = null
+  }
+
+  reset() {
+    this.readings.length = 0
+    this.active = false
+    this.value = Infinity
+    this._t = null
+  }
+
+  /**
+   * @param {number} limitMm this frame's sleeve edge (mm along the arm), Infinity for none
+   * @param {number} t ms
+   * @returns {number} the believed sleeve edge, Infinity for none
+   */
+  filter(limitMm, t) {
+    const dt = this._t === null ? 0 : Math.min(0.1, Math.max(0, (t - this._t) / 1000))
+    this._t = t
+    const r = this.readings
+    r.push({ limit: limitMm, t })
+    while (r.length > SLEEVE_WINDOW || (r.length && t - r[0].t > SLEEVE_WINDOW_MS)) r.shift()
+    const seen = r.filter((x) => Number.isFinite(x.limit)).map((x) => x.limit).sort((a, b) => a - b)
+    const share = seen.length / r.length
+    if (!this.active && r.length >= 6 && share >= SLEEVE_ENTER) {
+      this.active = true
+      this.value = seen[seen.length >> 1]
+    } else if (this.active && share <= SLEEVE_EXIT) {
+      this.active = false
+      this.value = Infinity
+    } else if (this.active && seen.length) {
+      const target = seen[seen.length >> 1]
+      const step = SLEEVE_SLEW_MM_S * dt
+      this.value += Math.max(-step, Math.min(step, target - this.value))
+    }
+    return this.active ? this.value : Infinity
+  }
+}
+
 /**
  * One-frame outlier rejection for a scalar measurement.
  *

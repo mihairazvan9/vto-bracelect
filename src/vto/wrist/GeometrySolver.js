@@ -19,6 +19,17 @@ const FREEZE_MIN_READINGS = 30
 const FREEZE_MAX_SPREAD = 0.1 // interquartile range / median
 const SINGLE_VIEW_WINDOW = 60
 const REFERENCE_S = 18 // mm from the crease: the middle of the bracelet zone
+/**
+ * What an adult wrist can be, relative to itself and to the hand: width over
+ * depth (adult wrists run ~1.2-1.5), and width over the wrist-to-knuckle span
+ * (0.65-0.79 on the SAM reference masks of the recordings, see WristObserver).
+ * Without these the multi-view fit, fed a few noisy roll bins, produced an
+ * 81 x 45 mm wrist on one recording and a 190 mm circumference on another.
+ */
+const ASPECT_MIN = 1.1
+const ASPECT_MAX = 1.6
+const WIDTH_PER_PALM_MIN = 0.55
+const WIDTH_PER_PALM_MAX = 0.85
 
 /**
  * Recovers the wrist cross-section from multiple viewing angles.
@@ -38,9 +49,24 @@ export class GeometrySolver {
     this.profileRatios = null
     this.profileCounts = null
 
+    /**
+     * The shape as MEASURED, in the observations' own millimetres. Everything
+     * inside the solver (blending, the plausibility bounds, the freeze test)
+     * works on these; the published widthMm / depthMm below are these scaled
+     * to a tape-measured circumference when there is one. Mixing the two once
+     * kept a wrist with a manual size from ever freezing.
+     */
+    this._w = 52
+    this._d = 38
+    /**
+     * Whether the shape has been measured yet (this session, or remembered
+     * from one). Until then widthMm / depthMm are only a placeholder to build
+     * geometry with: never shown, sized against or worn (see sizeKnown).
+     */
+    this.measured = false
     this.widthMm = 52
     this.depthMm = 38
-    this.circumferenceMm = 160
+    this.circumferenceMm = ellipseCircumference(26, 19)
     this.aspect = 52 / 38
 
     this.locked = false
@@ -62,6 +88,8 @@ export class GeometrySolver {
     this.profileRatios = null
     this.profileCounts = null
     this.locked = false
+    this.remembered = false
+    this.measured = false
     this.geometryConfidence = 0
     this.coverage = 0
     this.sampleCount = 0
@@ -70,14 +98,41 @@ export class GeometrySolver {
     this.goodFrames = 0
   }
 
+  /**
+   * Start from this person's wrist as measured in earlier sessions on this
+   * device (see VTOEngine's wrist memory): the shape is set and frozen at
+   * once. Monocular scale differs by up to +-25 % between sessions of the
+   * same hand on the recordings - consistent within a session, never across
+   * - so remembering is what makes a returning person the same size every
+   * time. reset() ("Re-measure") measures afresh.
+   * @returns {boolean} whether the memory was usable
+   */
+  adoptRemembered({ widthMm, depthMm } = {}) {
+    if (!(widthMm > 25 && widthMm < 90 && depthMm > 18 && depthMm < 70)) return false
+    this._w = widthMm
+    this._d = depthMm
+    this.measured = true
+    this._publish()
+    this.geometryConfidence = 0.75
+    this.coverage = 1
+    this.locked = true
+    this.remembered = true
+    return true
+  }
+
   unlock() {
     this.locked = false
+  }
+
+  /** A real wrist size is known: measured, remembered, or typed in. No placeholder is ever used as one. */
+  get sizeKnown() {
+    return this.measured || !!this.manualCircumferenceMm
   }
 
   /** Override the estimate with a tape-measured circumference. */
   setManualCircumference(mm) {
     this.manualCircumferenceMm = mm && mm > 80 && mm < 260 ? mm : null
-    if (this.manualCircumferenceMm) this._applyCircumference(this.manualCircumferenceMm)
+    this._publish()
   }
 
   /**
@@ -85,6 +140,7 @@ export class GeometrySolver {
    */
   ingest(observation) {
     if (!observation || observation.poseConfidence < 0.35) return false
+    if (observation.palmLengthMm > 0) this._palmMm = observation.palmLengthMm
 
     // Frozen: nothing about the arm's SHAPE changes any more - not its
     // cross-section, not how it widens up the arm. Only the pose moves.
@@ -127,19 +183,27 @@ export class GeometrySolver {
       }
     }
 
-    const fit = fitEllipseFromSilhouettes(samples)
+    let fit = fitEllipseFromSilhouettes(samples)
     this.widthStability.push(ref.halfWidthMm * 2)
+    // Physically implausible aspect ratios mean the fit latched onto noise:
+    // fall back on the single-view estimate rather than on nothing (which
+    // left the built-in default shape standing for the whole session).
+    if (fit) {
+      const fitAspect = fit.a / Math.max(1e-3, fit.b)
+      if (fitAspect < 1.02 || fitAspect > 1.9) fit = null
+    }
 
     if (!fit) {
       this.geometryConfidence = clamp(this.coverage * 0.4, 0, 0.4)
       if (this._singleView.length >= 8) {
         const sorted = Float64Array.from(this._singleView).sort()
         const a = sorted[sorted.length >> 1]
-        this.widthMm += (2 * a - this.widthMm) * 0.25
-        this.depthMm = this.widthMm / PRIOR_ASPECT
-        this.aspect = PRIOR_ASPECT
-        this.circumferenceMm = ellipseCircumference(this.widthMm / 2, this.depthMm / 2)
-        if (this.manualCircumferenceMm) this._applyCircumference(this.manualCircumferenceMm)
+        // The first reading replaces the placeholder; later ones refine it.
+        this._w = this.measured ? this._w + (2 * a - this._w) * 0.25 : 2 * a
+        this.measured = true
+        this._d = this._w / PRIOR_ASPECT
+        this._plausible()
+        this._publish()
         this.geometryConfidence = Math.max(this.geometryConfidence, clamp(0.3 + this._singleView.length / 200, 0, 0.5))
       }
       this._maybeFreeze()
@@ -158,20 +222,12 @@ export class GeometrySolver {
     // The fit gives semi-axes; a is the radial (width) axis by construction.
     const width = fit.a * 2
     const depth = fit.b * 2
-    // Physically implausible aspect ratios mean the fit latched onto noise.
-    const aspect = width / Math.max(1e-3, depth)
-    if (aspect < 1.02 || aspect > 2.3) {
-      this.geometryConfidence *= 0.4
-      return false
-    }
-
     const blend = this.geometryConfidence > 0.6 ? 0.25 : 0.1
-    this.widthMm += (width - this.widthMm) * blend
-    this.depthMm += (depth - this.depthMm) * blend
-    this.aspect = this.widthMm / this.depthMm
-    this.circumferenceMm = ellipseCircumference(this.widthMm / 2, this.depthMm / 2)
-
-    if (this.manualCircumferenceMm) this._applyCircumference(this.manualCircumferenceMm)
+    this._w = this.measured ? this._w + (width - this._w) * blend : width
+    this._d = this.measured ? this._d + (depth - this._d) * blend : depth
+    this.measured = true
+    this._plausible()
+    this._publish()
 
     if (this.geometryConfidence > 0.78 && this.coverage > 0.55 && this.sampleCount >= 5) {
       this.locked = true
@@ -194,16 +250,25 @@ export class GeometrySolver {
     // Interquartile range, not the median absolute deviation: readings split
     // between two values half-and-half have a MAD of zero, and would freeze.
     const spread = (sorted[Math.floor(n * 0.75)] - sorted[Math.floor(n * 0.25)]) / med
-    const converged = Math.abs(this.widthMm - 2 * med) / (2 * med) < 0.03
+    const converged = Math.abs(this._w - 2 * med) / (2 * med) < 0.03
     if (spread <= FREEZE_MAX_SPREAD && (converged || this.coverage > 0.55)) this.locked = true
   }
 
-  _applyCircumference(mm) {
-    // Keep the measured aspect ratio, scale to the known circumference.
-    const scale = mm / Math.max(1e-3, this.circumferenceMm)
-    this.widthMm *= scale
-    this.depthMm *= scale
-    this.circumferenceMm = mm
+  /** Keep the shape inside what an adult wrist can be (see ASPECT_MIN and friends). */
+  _plausible() {
+    const palm = this._palmMm
+    if (palm > 0) this._w = clamp(this._w, palm * WIDTH_PER_PALM_MIN, palm * WIDTH_PER_PALM_MAX)
+    this._d = clamp(this._d, this._w / ASPECT_MAX, this._w / ASPECT_MIN)
+  }
+
+  /** The measured shape, scaled to the tape-measured circumference if there is one (aspect kept). */
+  _publish() {
+    const measured = ellipseCircumference(this._w / 2, this._d / 2)
+    const k = this.manualCircumferenceMm ? this.manualCircumferenceMm / Math.max(1e-3, measured) : 1
+    this.widthMm = this._w * k
+    this.depthMm = this._d * k
+    this.aspect = this._w / this._d
+    this.circumferenceMm = measured * k
   }
 
   /**

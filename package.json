@@ -9,7 +9,8 @@
     "preview": "vite preview",
     "verify": "node scripts/verify-solvers.mjs",
     "bench": "node scripts/bench.mjs",
-    "bench:jewelry": "node scripts/bench-jewelry.mjs"
+    "bench:jewelry": "node scripts/bench-jewelry.mjs",
+    "scorecard": "node scripts/scorecard.mjs"
   },
   "dependencies": {
     "@mediapipe/tasks-vision": "^1.0.1",

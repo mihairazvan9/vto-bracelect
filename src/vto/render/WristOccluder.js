@@ -78,14 +78,11 @@ const MASK_TRIM_GLSL = /* glsl */ `
  * It writes depth only, so a chain passing behind the arm is hidden by real
  * geometry, and it is trimmed to the segmentation silhouette so the edge is
  * pixel-accurate rather than approximately right.
- *
- * The same geometry is reused as the skin shader that receives contact shadows.
  */
 export class WristOccluder {
-  constructor(contactShadow) {
+  constructor() {
     this.sectionCount = 9 // one extra ring toward the hand
     this.geometry = this._buildGeometry()
-    this.contactShadow = contactShadow
 
     this.maskTexture = new THREE.DataTexture(new Uint8Array([255]), 1, 1, THREE.RedFormat)
     this.maskTexture.needsUpdate = true
@@ -135,77 +132,13 @@ export class WristOccluder {
       side: THREE.DoubleSide,
     })
 
-    this.shadowUniforms = {
-      ...shared,
-      ...contactShadow.uniforms,
-    }
-
-    this.shadowMaterial = new THREE.ShaderMaterial({
-      uniforms: this.shadowUniforms,
-      vertexShader: /* glsl */ `
-        varying vec4 vContactCoord;
-        uniform mat4 uContactMatrix;
-        void main() {
-          vec4 world = modelMatrix * vec4(position, 1.0);
-          vContactCoord = uContactMatrix * world;
-          gl_Position = projectionMatrix * viewMatrix * world;
-        }
-      `,
-      fragmentShader: /* glsl */ `
-        ${MASK_TRIM_GLSL}
-        #include <packing>
-        varying vec4 vContactCoord;
-        uniform sampler2D uContactMap;
-        uniform float uContactRange;
-        uniform float uContactDepthRange;
-        uniform float uContactStrength;
-        uniform float uPresence;
-
-        void main() {
-          float coverage = armCoverage();
-          if (coverage < 0.4) discard;
-
-          vec3 proj = vContactCoord.xyz / vContactCoord.w;
-          vec2 uv = proj.xy * 0.5 + 0.5;
-          float here = proj.z * 0.5 + 0.5;
-
-          float shade = 0.0;
-          if (uv.x > 0.0 && uv.x < 1.0 && uv.y > 0.0 && uv.y < 1.0) {
-            float stored = unpackRGBAToDepth(texture2D(uContactMap, uv));
-            // Gap between the skin and whatever metal is hovering above it.
-            float gapMm = (here - stored) * uContactDepthRange;
-            if (gapMm > 0.0) {
-              shade = 1.0 - smoothstep(0.0, uContactRange, gapMm);
-            }
-          }
-
-          // Only bare skin receives the contact term; fabric must not darken.
-          shade *= uContactStrength * uPresence * smoothstep(0.6, 0.92, coverage);
-          // Multiplicative: we are darkening the camera image, not drawing on it.
-          gl_FragColor = vec4(vec3(1.0 - shade), 1.0);
-        }
-      `,
-      transparent: true,
-      blending: THREE.CustomBlending,
-      blendSrc: THREE.DstColorFactor,
-      blendDst: THREE.ZeroFactor,
-      blendEquation: THREE.AddEquation,
-      depthWrite: false,
-      depthTest: true,
-      side: THREE.FrontSide,
-    })
-
     this.depthMesh = new THREE.Mesh(this.geometry, this.depthMaterial)
     this.depthMesh.frustumCulled = false
     this.depthMesh.renderOrder = -10
 
-    this.shadowMesh = new THREE.Mesh(this.geometry, this.shadowMaterial)
-    this.shadowMesh.frustumCulled = false
-    this.shadowMesh.renderOrder = 20 // after jewellery, so it reads final depth
-
     // The tube is built in arm space and placed by the arm's frame matrix,
     // the same matrix the chain physics runs in.
-    for (const mesh of [this.depthMesh, this.shadowMesh]) mesh.matrixAutoUpdate = false
+    this.depthMesh.matrixAutoUpdate = false
 
     this._positions = this.geometry.attributes.position.array
     /** Cross-section shape the vertices were last built for (s, a, b per section). */
@@ -250,19 +183,15 @@ export class WristOccluder {
   update(twin) {
     if (!twin.valid) {
       this.depthMesh.visible = false
-      this.shadowMesh.visible = false
       return
     }
     this.depthMesh.visible = true
-    this.shadowMesh.visible = true
 
     if (this._shapeChanged(twin)) this._build()
 
     twin.frameMatrix(this.frame)
-    for (const mesh of [this.depthMesh, this.shadowMesh]) {
-      mesh.matrix.copy(this.frame)
-      mesh.matrixWorldNeedsUpdate = true
-    }
+    this.depthMesh.matrix.copy(this.frame)
+    this.depthMesh.matrixWorldNeedsUpdate = true
   }
 
   /** Has the measured cross-section moved by more than a hundredth of a mm? */
@@ -377,7 +306,6 @@ export class WristOccluder {
   dispose() {
     this.geometry.dispose()
     this.depthMaterial.dispose()
-    this.shadowMaterial.dispose()
     this.maskTexture.dispose()
   }
 }

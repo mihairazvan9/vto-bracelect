@@ -1,3 +1,5 @@
+import * as THREE from 'three'
+
 /**
  * 1€ filter — adaptive low-pass that trades lag for jitter based on speed.
  * Slow movement => heavy smoothing (kills jitter).
@@ -78,6 +80,61 @@ export class OneEuroVec {
     this.filters.forEach((f) => f.reset())
   }
 }
+
+/**
+ * 1€ filter on a direction (a unit vector).
+ *
+ * The same idea as OneEuroQuat, for a direction alone: the speed is the angle
+ * between the filtered and the new direction per second, and each step turns
+ * the filtered direction toward the new one by the resulting alpha. Used for
+ * the forearm axis, so the axis is not smoothed by how noisy the ROLL about it
+ * is (a full-orientation filter reads roll noise as speed and lets it through).
+ */
+export class OneEuroDir {
+  constructor({ minCutoff = 1.0, beta = 0.5, dCutoff = 1.0 } = {}) {
+    this.minCutoff = minCutoff
+    this.beta = beta
+    this.dCutoff = dCutoff
+    this.value = null
+    this.speed = new LowPass()
+    this.lastTime = null
+  }
+
+  /**
+   * @param {import('three').Vector3} v new unit direction
+   * @param {number} timestamp ms
+   * @param {number} [trust=1] 0..1, lowers the cutoff for doubtful input
+   * @returns the filtered direction (owned by the filter)
+   */
+  filter(v, timestamp, trust = 1) {
+    if (this.value === null) {
+      this.value = v.clone().normalize()
+      this.lastTime = timestamp
+      return this.value
+    }
+    let dt = 1 / 60
+    if (timestamp > this.lastTime) dt = (timestamp - this.lastTime) / 1000
+    this.lastTime = timestamp
+    const angle = this.value.angleTo(v)
+    const rate = this.speed.filter(angle / dt, alphaFor(this.dCutoff, dt))
+    const cutoff = (this.minCutoff + this.beta * rate) * (0.4 + 0.6 * Math.min(1, Math.max(0, trust)))
+    const a = alphaFor(cutoff, dt)
+    if (angle > 1e-7) {
+      const axis = _dirAxis.crossVectors(this.value, v)
+      if (axis.lengthSq() > 1e-14) this.value.applyAxisAngle(axis.normalize(), angle * a).normalize()
+      else if (a > 0.5) this.value.copy(v) // opposite: no unique axis, take it when the step would anyway
+    }
+    return this.value
+  }
+
+  reset() {
+    this.value = null
+    this.speed.reset()
+    this.lastTime = null
+  }
+}
+
+const _dirAxis = new THREE.Vector3()
 
 /**
  * 1€ filter on orientation.

@@ -2,7 +2,7 @@ import * as THREE from 'three'
 import { CameraStream } from './camera/CameraStream.js'
 import { CameraModel } from './camera/CameraModel.js'
 import { PerceptionSystem } from './perception/PerceptionSystem.js'
-import { WristObserver } from './wrist/WristObserver.js'
+import { WristObserver, palmFromScale } from './wrist/WristObserver.js'
 import { WristTracker } from './wrist/WristTracker.js'
 import { FREEZE_FRAMES } from './wrist/GeometrySolver.js'
 import { FitSolver } from './fit/FitSolver.js'
@@ -10,7 +10,6 @@ import { RigidSolver } from './physics/RigidSolver.js'
 import { XPBDChainSolver } from './physics/XPBDChainSolver.js'
 import { BraceletMesh } from './render/jewelryMeshes.js'
 import { WristOccluder } from './render/WristOccluder.js'
-import { ContactShadow } from './render/ContactShadow.js'
 import { LightEstimator } from './render/LightEstimator.js'
 import { SkeletonDebug } from './render/SkeletonDebug.js'
 import { SegmentationDebug } from './render/SegmentationDebug.js'
@@ -19,12 +18,26 @@ import { HAND_CONNECTIONS } from './perception/models.js'
 import { WristFrameDebug } from './render/WristFrameDebug.js'
 import { WallsDebug } from './render/WallsDebug.js'
 import { BraceletCategory } from './assets/schema.js'
+import { DEFAULT_LIVELINESS } from './physics/tuning.js'
 import { TrackingState } from './core/TrackingState.js'
 import { clamp } from './core/mathUtils.js'
 
 const MAX_RENDER_WIDTH = 1280
 /** How long a fitted arm outline is kept through frames that produced none. */
 const ARM_OUTLINE_HOLD_MS = 150
+/**
+ * This device's memory of the wearer's wrist (see GeometrySolver.adoptRemembered):
+ * MediaPipe's raw palm reading and the wrist's shape relative to the palm,
+ * averaged over at most this many sessions, so one unlucky session cannot
+ * redefine a person. The shape ratios are measurements; the millimetres
+ * follow from the palm (palmFromScale), which tightens as sessions add up.
+ * v1 stored millimetres read at MediaPipe's own scale - 119 mm for one
+ * session of a hand that read 154 mm in the next - and is not carried over.
+ */
+const WRIST_MEMORY_KEY = 'mmto.wrist.v2'
+const WRIST_MEMORY_SESSIONS = 5
+/** Good palm frames a session with a remembered wrist reads before adding them to the memory. */
+const PALM_MEMORY_SAMPLES = 30
 
 
 /**
@@ -74,9 +87,8 @@ export class VTOEngine {
     this.jewelryRoot = new THREE.Group()
     this.scene.add(this.jewelryRoot)
 
-    this.contactShadow = new ContactShadow(quality === 'high' ? 256 : 128)
-    this.occluder = new WristOccluder(this.contactShadow)
-    this.scene.add(this.occluder.depthMesh, this.occluder.shadowMesh)
+    this.occluder = new WristOccluder()
+    this.scene.add(this.occluder.depthMesh)
 
     this.lighting = new LightEstimator(this.renderer)
 
@@ -139,10 +151,13 @@ export class VTOEngine {
       handMs: 0,
       segMs: 0,
       presence: 0,
+      wristKnown: false,
       wristWidthMm: 0,
       wristDepthMm: 0,
       circumferenceMm: 0,
       shapeLocked: false,
+      /** The wrist shape came from this device's memory of earlier sessions. */
+      wristRemembered: false,
       visualFitConfidence: 0,
       physicalSizeConfidence: 0,
       jitterPx: 0,
@@ -161,6 +176,8 @@ export class VTOEngine {
       silhouetteConfidence: 0,
       refineMs: 0,
       maskActive: false,
+      /** Frames per second the camera actually delivers (0 = unknown). */
+      cameraFps: 0,
     }
 
     this.options = {
@@ -171,9 +188,11 @@ export class VTOEngine {
       showSegmentation: false,
       /** Draw the invisible physics walls that keep the bracelet on the arm. */
       showWalls: false,
-      /** Full gravity (slide, sag, tilt) instead of the stable default. */
-      realisticPhysics: false,
-      contactShadows: true,
+      /**
+       * How alive the jewellery is, 0 (calm) .. 1 (lively): how much of the
+       * arm's motion reaches it and how fast that dies away (physics/tuning.js).
+       */
+      physicsLiveliness: DEFAULT_LIVELINESS,
       lightEstimation: true,
     }
 
@@ -188,6 +207,7 @@ export class VTOEngine {
     this._solveIndices = []
     /** A CaptureSession recording test clips, or null (dev tool). */
     this.capture = null
+    this._lastFrameTime = -Infinity
   }
 
   async start(constraints) {
@@ -195,6 +215,7 @@ export class VTOEngine {
     await this.perception.init()
     this._syncResolution()
     this._resolveLens()
+    this._recallWrist()
     this._running = true
     this._lastFrame = performance.now()
     requestAnimationFrame(this._onFrame)
@@ -207,6 +228,7 @@ export class VTOEngine {
     this._resolveLens()
     this.observer.reset()
     this.tracker.reset()
+    this._recallWrist()
     this.instances.forEach((i) => {
       i.rigid?.reset()
       i.chain?.reset()
@@ -267,10 +289,59 @@ export class VTOEngine {
     this.tracker.geometry.setManualCircumference(mm)
   }
 
+  /** Measure the wrist afresh - and forget what this device remembered about it. */
   recalibrate() {
+    try {
+      localStorage.removeItem(WRIST_MEMORY_KEY)
+    } catch {
+      // storage unavailable: nothing was remembered either
+    }
+    this.observer.setRememberedPalm(null)
     this.tracker.geometry.reset()
+    this._wristSaved = false
     this.calibration.active = true
     this.calibration.locked = false
+  }
+
+  /** Start from the wrist this device measured before, if any. */
+  _recallWrist() {
+    const memory = readWristMemory()
+    if (!memory) return
+    this.observer.setRememberedPalm(memory.palmRawMm, memory.sessions)
+    const palm = palmFromScale(memory.palmRawMm, memory.sessions)
+    const shape = { widthMm: memory.widthPerPalm * palm, depthMm: memory.depthPerPalm * palm }
+    if (this.tracker.geometry.adoptRemembered(shape)) this.calibration.active = false
+  }
+
+  /**
+   * Fold this session into this device's memory, once: a running mean over
+   * the last WRIST_MEMORY_SESSIONS sessions. A session that measured the
+   * wrist adds its shape and palm; one that started from the memory adds its
+   * palm reading only (its shape was never measured). Returns whether this
+   * session is done with the memory.
+   */
+  _rememberWrist() {
+    const g = this.tracker.geometry
+    const scale = this.observer.palmScale
+    if (g.manualCircumferenceMm || !scale.locked) return false
+    const prev = readWristMemory()
+    if (g.remembered && (!prev || scale.samples < PALM_MEMORY_SAMPLES)) return !prev
+    const n = Math.min(prev?.sessions ?? 0, WRIST_MEMORY_SESSIONS - 1)
+    const mix = (a, b) => (prev ? (a * n + b) / (n + 1) : b)
+    const memory = {
+      // Geometric mean: the reading's error is a scale factor.
+      palmRawMm: +Math.exp(mix(Math.log(prev?.palmRawMm), Math.log(scale.rawMm))).toFixed(1),
+      widthPerPalm: g.remembered ? prev.widthPerPalm : +mix(prev?.widthPerPalm, g.widthMm / scale.mm).toFixed(4),
+      depthPerPalm: g.remembered ? prev.depthPerPalm : +mix(prev?.depthPerPalm, g.depthMm / scale.mm).toFixed(4),
+      sessions: n + 1,
+      at: new Date().toISOString(),
+    }
+    try {
+      localStorage.setItem(WRIST_MEMORY_KEY, JSON.stringify(memory))
+    } catch {
+      // storage unavailable (private window): the session simply is not remembered
+    }
+    return true
   }
 
   skipCalibration() {
@@ -291,11 +362,12 @@ export class VTOEngine {
 
     // --- Perception (budgeted, may do nothing this frame) ------------------
     if (this.stream.hasNewFrame()) {
-      this._displayTime = now
-      this.perception.process(this.stream.video, now)
+      const frameTime = this._frameTime(now)
+      this._displayTime = frameTime
+      this.perception.process(this.stream.video, frameTime)
       // Refine the arm mask first: the observation below reads the silhouette
       // through it, so it has to describe THIS frame, not the network's last.
-      this.perception.refineArm(this.stream.video, now)
+      this.perception.refineArm(this.stream.video, frameTime)
 
       // Re-solve whenever either detector produced something new, not just the
       // hand: in pose-only mode the hand never updates at all.
@@ -303,7 +375,7 @@ export class VTOEngine {
       if (this.perception.revision !== this._lastRevision) {
         this._lastRevision = this.perception.revision
         const source = this.sources.build(this.perception.hands, this.cameraModel)
-        observation = this.observer.observe(source, this.perception, now)
+        observation = this.observer.observe(source, this.perception, frameTime)
         if (observation) {
           this.tracker.ingest(observation)
           this.lastLandmarks3D = observation.landmarks3D
@@ -326,8 +398,8 @@ export class VTOEngine {
       // Guided recording (dev tool, src/vto/capture): one sample for every
       // camera frame the hand detector ran on, with what it and the arm
       // segmentation made of that frame.
-      if (this.capture && this.perception.handTimestamp === now) {
-        this.capture.onFrame(this._captureSample(now, observation))
+      if (this.capture && this.perception.handTimestamp === frameTime) {
+        this.capture.onFrame(this._captureSample(frameTime, observation))
       }
     }
 
@@ -338,6 +410,16 @@ export class VTOEngine {
     this._updateCalibration()
 
     // --- Fit + physics ------------------------------------------------------
+    // A wrist size just became known (first measurement, or after Re-measure):
+    // seat every piece afresh on it rather than on whatever arm it last saw.
+    const sizeKnown = this.tracker.geometry.sizeKnown
+    if (sizeKnown && !this._sizeWasKnown) {
+      for (const inst of this.instances) {
+        inst.rigid?.reset()
+        inst.chain?.reset()
+      }
+    }
+    this._sizeWasKnown = sizeKnown
     if (twin.valid) {
       this._solveStack(twin, dt)
     }
@@ -365,7 +447,6 @@ export class VTOEngine {
     this.occluder.setArm(twin.valid ? this._armOverlay : null)
     this.occluder.setPresence(presence)
     this.occluder.setDebug(this.options.showOccluder)
-    this.occluder.shadowMesh.visible = this.options.contactShadows && twin.valid
 
     for (const inst of this.instances) inst.mesh.setPresence(presence)
 
@@ -401,11 +482,6 @@ export class VTOEngine {
     )
 
     // --- Render -------------------------------------------------------------
-    this.contactShadow.enabled = this.options.contactShadows
-    if (this.options.contactShadows && twin.valid && presence > 0.02) {
-      this.contactShadow.render(this.renderer, this.jewelryRoot, twin)
-    }
-
     this.renderer.clear(true, true, false)
     this.renderer.render(this.bgScene, this.bgCamera)
     this.renderer.clearDepth()
@@ -420,6 +496,7 @@ export class VTOEngine {
     // instead of intersecting, then the chains collide with their neighbours.
     let cursor = 0
     const neighbours = []
+    const physics = { liveliness: this.options.physicsLiveliness }
 
     for (let i = 0; i < this.instances.length; i++) {
       const inst = this.instances[i]
@@ -430,7 +507,7 @@ export class VTOEngine {
       inst.fit = this.fitSolver.evaluate(inst.asset, twin, bias)
 
       if (inst.rigid) {
-        inst.rigid.solve(inst.asset, inst.fit, twin, dt, { realistic: this.options.realisticPhysics })
+        inst.rigid.solve(inst.asset, inst.fit, twin, dt, neighbours, physics)
         inst.mesh.applyRigid(inst.rigid, inst.fit)
         neighbours.push({
           center: inst.rigid.position,
@@ -440,7 +517,7 @@ export class VTOEngine {
           stockRadiusMm: inst.asset.stockRadiusMm,
         })
       } else {
-        inst.chain.solve(inst.asset, inst.fit, twin, dt, neighbours, { realistic: this.options.realisticPhysics })
+        inst.chain.solve(inst.asset, inst.fit, twin, dt, neighbours, physics)
         inst.mesh.applyChain(inst.chain)
         neighbours.push({
           center: twin.pointAt(inst.fit.restingOffsetMm, new THREE.Vector3()),
@@ -483,11 +560,31 @@ export class VTOEngine {
     this.has2D = n === 21
   }
 
+  /**
+   * The time of the camera frame being processed, ms: when the camera captured
+   * it, where the browser reports that (same clock as `now`), else the render
+   * loop's time. Everything downstream - detector timestamps, the filters'
+   * dt, the pose's display time - runs on it, so velocities are measured over
+   * the camera's real frame spacing rather than the render loop's jitter.
+   * Kept strictly increasing: MediaPipe rejects a timestamp that goes back.
+   */
+  _frameTime(now) {
+    let t = now
+    if (this.stream.frameTimeSource === 'capture') {
+      const capture = this.stream.frameTimeMs(now)
+      // Sanity: a capture time from the future, or from long ago, is not on our clock.
+      if (capture <= now && now - capture < 500) t = capture
+    }
+    if (t <= this._lastFrameTime) t = this._lastFrameTime + 0.01
+    this._lastFrameTime = t
+    return t
+  }
+
   /** What a CaptureSession gets per recorded frame. Valid only during the call. */
-  _captureSample(now, observation) {
+  _captureSample(frameTime, observation) {
     return {
-      now,
-      captureTimeMs: this.stream.frameTimeMs(now),
+      now: frameTime,
+      captureTimeMs: frameTime,
       video: this.stream.video,
       hands: this.perception.hands,
       armMask: this.perception.armMask,
@@ -531,6 +628,21 @@ export class VTOEngine {
     const steady = Math.min(1, g.goodFrames / FREEZE_FRAMES)
     this.calibration.coverage = Math.max(g.coverage, steady)
     this.calibration.locked = g.locked
+    // Segment less once the wrist is measured. Replayed on the recordings, the
+    // arm network every ~150 ms (with the per-frame refinement tracking the arm
+    // in between) placed the arm as well as every frame did; only once it ran
+    // less than ~3x a second did direction and width errors grow, and run once
+    // then tracked by colour alone the arm drifted off (README). So: 12 Hz while
+    // measuring, 6 Hz while tracking a measured wrist, back to 12 Hz while the
+    // arm moves fast or its silhouette is weak.
+    const fast = this.tracker.velocity.length() > 300 || this.tracker.omega.length() > 3
+    const weak = this.rawFrame.valid && this.rawFrame.silhouetteConfidence < 0.2
+    const segHz = !g.locked || fast || weak ? 12 : 6
+    if (segHz !== this._segHz) {
+      this._segHz = segHz
+      this.perception.setBudget({ segHz })
+    }
+    if (g.locked && !this._wristSaved) this._wristSaved = this._rememberWrist()
     if (g.locked) {
       this.calibration.active = false
     } else if (this.calibration.active) {
@@ -569,10 +681,15 @@ export class VTOEngine {
     d.segHz = Math.round(this.perception.stats.segHz)
     d.handMs = +this.perception.stats.handMs.toFixed(1)
     d.segMs = +this.perception.stats.segMs.toFixed(1)
-    d.wristWidthMm = +twin.wristWidthMm.toFixed(1)
-    d.wristDepthMm = +twin.wristDepthMm.toFixed(1)
-    d.circumferenceMm = +twin.circumferenceMm.toFixed(1)
+    // No size is reported until one is known: the solver's placeholder wrist
+    // is not the user's.
+    const known = this.tracker.geometry.sizeKnown
+    d.wristKnown = known
+    d.wristWidthMm = known ? +twin.wristWidthMm.toFixed(1) : 0
+    d.wristDepthMm = known ? +twin.wristDepthMm.toFixed(1) : 0
+    d.circumferenceMm = known ? +twin.circumferenceMm.toFixed(1) : 0
     d.shapeLocked = twin.shapeLocked
+    d.wristRemembered = !!this.tracker.geometry.remembered
     d.sleeveLimitMm = twin.sleeveLimitMm
     d.rollDeg = Math.round(this.rawFrame.rollDeg)
     d.dorsalAgreement = +this.rawFrame.dorsalAgreement.toFixed(2)
@@ -586,6 +703,7 @@ export class VTOEngine {
     d.silhouetteConfidence = +this.rawFrame.silhouetteConfidence.toFixed(2)
     d.refineMs = +this.perception.stats.refineMs.toFixed(2)
     d.maskActive = !!this.perception.armMask
+    d.cameraFps = Math.round(this.stream.cameraFps)
     d.jitterPx = +this.tracker.metrics.positionJitterPx.mean.toFixed(2)
     d.jitterDeg = +this.tracker.metrics.rotationJitterDeg.mean.toFixed(2)
     d.breathingPct = +this.tracker.metrics.scaleBreathingPct.mean.toFixed(2)
@@ -651,11 +769,20 @@ export class VTOEngine {
     this.wristFrameDebug.dispose()
     this.wallsDebug.dispose()
     this.occluder.dispose()
-    this.contactShadow.dispose()
     this.lighting.dispose()
     this.videoTexture.dispose()
     this.bgQuad.geometry.dispose()
     this.bgQuad.material.dispose()
     this.renderer.dispose()
+  }
+}
+
+/** The remembered wrist, or null when there is none or storage is unavailable. */
+function readWristMemory() {
+  try {
+    const m = JSON.parse(localStorage.getItem(WRIST_MEMORY_KEY) ?? 'null')
+    return m && m.palmRawMm > 40 && m.palmRawMm < 160 && m.widthPerPalm > 0.3 && m.depthPerPalm > 0.2 && m.sessions >= 1 ? m : null
+  } catch {
+    return null
   }
 }

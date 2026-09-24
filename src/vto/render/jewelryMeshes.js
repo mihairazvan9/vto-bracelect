@@ -33,7 +33,12 @@ function buildRigidGeometry(asset, ringA, ringB) {
   const closed = asset.category === BraceletCategory.RIGID_BANGLE
   const gapArc = closed ? 0 : (asset.opening.gapMm / Math.max(1e-3, (ringA + ringB) * 0.5)) // radians
   const arc = Math.PI * 2 - gapArc
-  const path = new EllipsePath(ringA, ringB, arc, gapArc * 0.5)
+  // ringA / ringB are the INNER edge (the fit's inner circumference, and what
+  // RigidSolver's contact points sit on); the metal's centreline is one stock
+  // radius further out. Drawn on the inner edge, half the metal sank into the
+  // skin wherever the piece touched the arm.
+  const rho = asset.stockRadiusMm
+  const path = new EllipsePath(ringA + rho, ringB + rho, arc, gapArc * 0.5)
   const tubular = closed ? 128 : 96
   const geo = new THREE.TubeGeometry(path, tubular, asset.stockRadiusMm, 20, closed)
 

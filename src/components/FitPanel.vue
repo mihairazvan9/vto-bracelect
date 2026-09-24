@@ -42,9 +42,9 @@ function pct(v) {
         <strong>{{ wrist ? `${wrist.toFixed(0)} mm` : '—' }}</strong>
       </div>
       <div class="measure__row measure__row--sub">
-        <span>{{ diagnostics.wristWidthMm }} × {{ diagnostics.wristDepthMm }} mm</span>
+        <span>{{ wrist ? `${diagnostics.wristWidthMm} × ${diagnostics.wristDepthMm} mm` : 'not measured yet' }}</span>
         <span :class="['lock', { 'lock--on': diagnostics.shapeLocked }]">
-          {{ diagnostics.shapeLocked ? 'shape locked' : 'measuring…' }}
+          {{ manualWrist ? 'your measurement' : diagnostics.wristRemembered ? 'remembered' : diagnostics.shapeLocked ? 'shape locked' : 'measuring…' }}
         </span>
       </div>
 

@@ -2,6 +2,7 @@
 import { defineAsyncComponent, onBeforeUnmount, onMounted, reactive, ref, shallowRef } from 'vue'
 import { VTOEngine } from './vto/VTOEngine.js'
 import { CATALOG, getBracelet } from './vto/assets/catalog.js'
+import { DEFAULT_LIVELINESS } from './vto/physics/tuning.js'
 import VtoStage from './components/VtoStage.vue'
 import CatalogPanel from './components/CatalogPanel.vue'
 import FitPanel from './components/FitPanel.vue'
@@ -26,21 +27,21 @@ const manualWrist = ref(null)
 const calibration = reactive({ active: true, coverage: 0, locked: false, prompt: '' })
 const diagnostics = reactive({
   fps: 0, state: 'LOST', handHz: 0, segHz: 0, handMs: 0, segMs: 0, presence: 0,
-  wristWidthMm: 0, wristDepthMm: 0, circumferenceMm: 0, shapeLocked: false,
+  wristKnown: false, wristWidthMm: 0, wristDepthMm: 0, circumferenceMm: 0, shapeLocked: false, wristRemembered: false,
   visualFitConfidence: 0, physicalSizeConfidence: 0,
   jitterPx: 0, jitterDeg: 0, breathingPct: 0, sleeveLimitMm: Infinity,
   rollDeg: 0, dorsalAgreement: 0, angularSpeedDeg: 0,
   reprojectionPx: 0, forearmCorrectionDeg: 0, forearmFromSilhouette: false, refineMs: 0, maskActive: false,
+  cameraFps: 0,
 })
 const options = reactive({
-  contactShadows: true,
   lightEstimation: true,
   showOccluder: false,
   landmarkView: 'off',
   showWristFrame: false,
   showSegmentation: false,
   showWalls: false,
-  realisticPhysics: false,
+  physicsLiveliness: DEFAULT_LIVELINESS,
 })
 const fits = ref([])
 
@@ -83,7 +84,8 @@ function poll() {
   if (!vto) return
   Object.assign(diagnostics, vto.diagnostics)
   Object.assign(calibration, vto.calibration)
-  fits.value = vto.instances.map((inst) => ({ ...inst.fit, name: inst.asset.name }))
+  // No verdicts against a wrist that has not been measured yet.
+  fits.value = vto.diagnostics.wristKnown ? vto.instances.map((inst) => ({ ...inst.fit, name: inst.asset.name })) : []
 }
 
 function syncStack() {
@@ -159,6 +161,7 @@ onBeforeUnmount(() => {
         :calibration="calibration"
         :state="diagnostics.state"
         :presence="diagnostics.presence"
+        :camera-fps="diagnostics.cameraFps"
         :quiet="capturing"
         @skip-calibration="engine?.skipCalibration()"
       >

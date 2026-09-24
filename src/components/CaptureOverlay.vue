@@ -44,6 +44,7 @@ const recording = computed(() => props.view.status === 'recording')
       {{ view.message }}
     </div>
 
+    <div v-if="view.rateNote" class="cap__rate">{{ view.rateNote }}</div>
     <div class="cap__checks">
       <span v-for="c in view.checks" :key="c.id" class="chip" :class="{ 'chip--ok': c.ok, 'chip--soft': c.soft && !c.ok }">
         {{ c.ok ? '✓' : c.soft ? '!' : '✕' }} {{ c.label }}
@@ -118,6 +119,11 @@ const recording = computed(() => props.view.status === 'recording')
 }
 .cap__message--bad { border: 1px solid rgba(255, 107, 98, 0.5); }
 
+.cap__rate {
+  position: absolute; left: 50%; bottom: 50px; transform: translateX(-50%);
+  max-width: calc(100% - 32px); font-size: 12px; color: #ffe3b0; text-align: center;
+  text-shadow: 0 1px 6px rgba(0, 0, 0, 0.8);
+}
 .cap__checks {
   position: absolute; left: 50%; bottom: 18px; transform: translateX(-50%);
   display: flex; gap: 6px; flex-wrap: wrap; justify-content: center; max-width: calc(100% - 24px);

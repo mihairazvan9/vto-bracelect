@@ -1,17 +1,39 @@
 <script setup>
-import { ref } from 'vue'
+import { ref, watch } from 'vue'
 
 const canvas = ref(null)
 defineExpose({ canvas })
 
-defineProps({
+const props = defineProps({
   calibration: { type: Object, required: true },
   state: { type: String, default: 'LOST' },
   presence: { type: Number, default: 0 },
+  /** Frames per second the camera really delivers; 0 = unknown. */
+  cameraFps: { type: Number, default: 0 },
   /** Hide the stage's own hints (another overlay, e.g. the clip recorder, is talking). */
   quiet: { type: Boolean, default: false },
 })
 defineEmits(['skip-calibration'])
+
+/**
+ * Webcams halve their frame rate in dim light to expose longer, and at 10-15
+ * fps no tracking looks smooth. Say so - but only once it has lasted a couple
+ * of seconds, and let it go again with some margin, so the hint never flickers.
+ */
+const LOW_FPS = 20
+const RECOVERED_FPS = 24
+const lowLight = ref(false)
+let lowSince = null
+watch(() => props.cameraFps, (fps) => {
+  const now = performance.now()
+  if (fps > 0 && fps < LOW_FPS) {
+    lowSince ??= now
+    if (now - lowSince > 2000) lowLight.value = true
+  } else {
+    lowSince = null
+    if (fps >= RECOVERED_FPS) lowLight.value = false
+  }
+})
 </script>
 
 <template>
@@ -29,6 +51,10 @@ defineEmits(['skip-calibration'])
       <div v-else-if="state === 'DEGRADED'" class="stage__hint">
         <span class="dot dot--degraded" />
         Tracking is weak — more light or a slower movement will help
+      </div>
+      <div v-else-if="lowLight" class="stage__hint">
+        <span class="dot dot--degraded" />
+        A little more light will make this smoother
       </div>
     </transition>
 

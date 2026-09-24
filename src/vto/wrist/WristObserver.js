@@ -114,6 +114,31 @@ const PALM_MM_MAX = 90
 /** A locked scale ignores samples further than this from it (fraction). */
 const SCALE_MAX_DEVIATION = 0.2
 
+/**
+ * The palm's size in millimetres, from MediaPipe's metric scale AND from what
+ * adult palms are. MediaPipe's scale is a learned guess, not a measurement:
+ * the same hand, camera and day read a wrist-to-knuckle span of 68-104 mm
+ * over nine recorded sessions (log SD 0.14), and every millimetre of the arm
+ * follows it - a 119 mm wrist in one session, 180 mm in another, and a real
+ * 180 mm bangle drawn 1.6x as wide as the arm in the first. Adult palms vary
+ * about half as much (log SD ~0.065), so the two are combined as independent
+ * log-normal estimates: one session's reading gets ~18 % of the weight, more
+ * as remembered sessions average its noise down. A tape-measured wrist
+ * (GeometrySolver.setManualCircumference) overrides all of it.
+ */
+const PALM_PRIOR_MM = 82
+const PALM_PRIOR_LOG_SD = 0.065
+const PALM_SESSION_LOG_SD = 0.14
+
+/** Palm length (mm) believed from MediaPipe's reading over `sessions` sessions. */
+export function palmFromScale(rawMm, sessions = 1) {
+  if (!(rawMm > 0)) return 0
+  const vp = PALM_PRIOR_LOG_SD * PALM_PRIOR_LOG_SD
+  const vm = (PALM_SESSION_LOG_SD * PALM_SESSION_LOG_SD) / Math.max(1, sessions)
+  const w = vp / (vp + vm)
+  return Math.exp(w * Math.log(rawMm) + (1 - w) * Math.log(PALM_PRIOR_MM))
+}
+
 /** How fast the wrist anchor follows the 2D landmark's offset from the fit. */
 const ANCHOR_TAU_S = 0.035
 /** Largest offset change believed per frame, as a fraction of palm length. */
@@ -189,7 +214,7 @@ export class WristObserver {
     /** 2D wrist landmark minus rigid-fit wrist, low-passed. Pixels. */
     this._anchorOffset = { x: 0, y: 0, t: -Infinity, valid: false }
     /** Locked metric palm length (see _updateScaleLock). */
-    this._scale = { samples: [], prior: [], value: 0 }
+    this._scale = { samples: [], prior: [], value: 0, remembered: null }
   }
 
   /**
@@ -208,8 +233,40 @@ export class WristObserver {
   }
 
   /**
-   * The person's palm length in mm: a robust median of well-measured frames.
-   * Returns 0 until enough good frames have been seen.
+   * MediaPipe's palm reading averaged over this person's earlier sessions on
+   * this device (raw mm, see palmFromScale), or null. The palm it implies
+   * stands in for this session's own, so a returning person gets the same
+   * wrist size every time (see _updateScaleLock). This session's reading is
+   * still taken, to be folded into the memory.
+   */
+  setRememberedPalm(rawMm, sessions = 1) {
+    this._scale.remembered = Number.isFinite(rawMm) && rawMm > 40 && rawMm < 160
+      ? palmFromScale(rawMm, sessions)
+      : null
+  }
+
+  /**
+   * The palm: `mm` as used for sizing, `rawMm` this session's own MediaPipe
+   * reading (what is remembered), and how many good frames support it.
+   */
+  get palmScale() {
+    const lock = this._scale
+    const locked = lock.samples.length >= SCALE_MIN_SAMPLES
+    return {
+      mm: lock.remembered ?? palmFromScale(lock.value),
+      rawMm: locked ? lock.value : 0,
+      samples: lock.samples.length,
+      locked,
+    }
+  }
+
+  /**
+   * The person's palm length in mm: a robust median of well-measured frames,
+   * combined with what adult palms are (palmFromScale). A palm remembered
+   * from earlier sessions on this device (setRememberedPalm) stands instead:
+   * MediaPipe's scale is steady within a session but not between sessions of
+   * the same hand, so remembering is what makes a returning person the same
+   * size. This session's frames are still read, for the memory.
    */
   _updateScaleLock(rawPalmMm, frontal, relResidual) {
     const lock = this._scale
@@ -225,7 +282,8 @@ export class WristObserver {
       if (lock.samples.length > SCALE_WINDOW) lock.samples.shift()
       lock.value = median(Float64Array.from(lock.samples).sort())
     }
-    if (lock.samples.length >= SCALE_MIN_SAMPLES) return lock.value
+    if (lock.remembered) return lock.remembered
+    if (lock.samples.length >= SCALE_MIN_SAMPLES) return palmFromScale(lock.value)
 
     // Not locked yet (the palm may never have faced the camera). Single
     // frames then swing 48-94 mm on a side-on clip, so hold a running median
@@ -234,9 +292,8 @@ export class WristObserver {
       lock.prior.push(Math.min(PALM_MM_MAX, Math.max(PALM_MM_MIN, rawPalmMm)))
       if (lock.prior.length > SCALE_WINDOW) lock.prior.shift()
     }
-    return lock.prior.length ? median(Float64Array.from(lock.prior).sort()) : 0
+    return lock.prior.length ? palmFromScale(median(Float64Array.from(lock.prior).sort())) : 0
   }
-
 
   /**
    * Track the offset from the rigid-fit wrist to the 2D wrist landmark.

@@ -1,15 +1,17 @@
 import * as THREE from 'three'
 import { WristDigitalTwin } from './WristDigitalTwin.js'
 import { GeometrySolver } from './GeometrySolver.js'
-import { OneEuroFilter, OneEuroQuat, OneEuroVec } from '../core/OneEuroFilter.js'
+import { OneEuroFilter, OneEuroVec } from '../core/OneEuroFilter.js'
+import { OrientationFilter } from './OrientationFilter.js'
 import {
   angularVelocity,
   clamp,
+  ellipseCircumference,
   integrateAngularVelocity,
   RunningStat,
 } from '../core/mathUtils.js'
 import { TrackingState, TrackingStateMachine } from '../core/TrackingState.js'
-import { SpikeGate, TwistGate } from './PoseGates.js'
+import { SleeveFilter, SpikeGate, TwistGate } from './PoseGates.js'
 
 const _v = new THREE.Vector3()
 const _q = new THREE.Quaternion()
@@ -33,6 +35,16 @@ const ARM_RULER_SECTION = 2
 /** Outline confidence -> ruler weight, and the most the ruler is ever trusted. */
 const ARM_RULER_GAIN = 2.2
 const ARM_RULER_MAX = 0.95
+/**
+ * The arm ruler's reading (log of arm-width distance over palm distance) is
+ * held back when it jumps further than this in one outline, until the next
+ * outline confirms it. The two distances move together when the arm really
+ * moves; their ratio jumping means a broken outline - on a still recording a
+ * mask that lost half the arm read 68 px against 144 px, and the arm and
+ * every bracelet on it shrank by a fifth for a quarter of a second. Frame to
+ * frame the ratio moves by ~3 %.
+ */
+const RULER_GATE = 0.15
 
 /** Arm stretch the centreline offset is read over: where bracelets sit, mm. */
 const CENTRE_FROM_MM = 9
@@ -56,9 +68,20 @@ const CENTRE_SLEW_MM_S = 90
 const RULER_SNAP_WEIGHT = 0.5
 
 /**
+ * Fastest the wrist's shape - as the arm tube, the physics and the arm ruler
+ * see it - may change, mm/s. Until the shape is frozen the measurement keeps
+ * refining (on an unlocked recording it moved by 10+ mm), and a tube that
+ * resized under a bracelet frame by frame threw it about; it glides instead.
+ * While the jewellery is hidden it simply takes the measurement.
+ */
+const SHAPE_GLIDE_MM_S = 10
+
+/**
  * Warm-up: a new track is shown only after this many consecutive steady
  * observations - confident, the same hand, and a palm depth that is not
- * still lurching (per-frame change in log depth). While MediaPipe locks on it
+ * still lurching (per-frame change in log depth) - and only once the wrist's
+ * size is known (measured, remembered or typed in): jewellery is never worn
+ * on a placeholder wrist. While MediaPipe locks on it
  * flips the hand's label, jumps the wrist 190 px across the image and
  * reports a depth 3x too far (the side-on recording); a bracelet shown on
  * that flies across the screen before it settles.
@@ -87,12 +110,21 @@ export class WristTracker {
     // log(depth): ~0.5 Hz when steady; moving toward the camera at 200 mm/s
     // (0.5 /s in log units) lifts it to ~1.5 Hz.
     this.depthFilter = new OneEuroFilter({ minCutoff: 0.5, beta: 2, dCutoff: 1.0 })
-    // Speed in rad/s: at rest the cutoff is ~1.2 Hz (kills jitter), a brisk
-    // 3 rad/s turn lifts it to ~4 Hz (kills lag).
-    this.rotationFilter = new OneEuroQuat({ minCutoff: 1.2, beta: 0.9, dCutoff: 1.0 })
+    // Direction and roll filtered apart (see OrientationFilter): the axis by a
+    // 1€ filter as before, the roll - the noisiest part of the pose - by a
+    // Kalman filter.
+    this.rotationFilter = new OrientationFilter()
     /** Drops the detector's mirror flips of the palm (see PoseGates). */
     this.twistGate = new TwistGate()
     this.centreGate = new SpikeGate(CENTRE_GATE_MM)
+    this.rulerGate = new SpikeGate(RULER_GATE)
+    /** A sleeve is believed only once it persists (see SleeveFilter). */
+    this.sleeveFilter = new SleeveFilter()
+    /**
+     * This frame's distance reading before filtering, mm (the arm ruler's
+     * blend): for the scorecard's depth-lag measure.
+     */
+    this.depthMeasurementMm = NaN
     /** False until the arm ruler has set the depth of this track once. */
     this._depthSettled = false
     this._snapDepth = false
@@ -142,6 +174,8 @@ export class WristTracker {
     this.centreFilter.reset()
     this.twistGate.reset()
     this.centreGate.reset()
+    this.rulerGate.reset()
+    this.sleeveFilter.reset()
     this._depthSettled = false
     this._snapDepth = false
     this._warm = false
@@ -168,13 +202,20 @@ export class WristTracker {
     const dt = this.hasPose ? Math.max(1e-3, (t - this.lastObservationTime) / 1000) : 0
 
     // --- Orientation -------------------------------------------------------
-    // 1€ on SO(3): heavy smoothing when still, light when turning. A long gap
-    // means a new hand, not a continuation, so do not smooth across it.
+    // Axis and roll filtered apart (OrientationFilter). A long gap means a new
+    // hand, not a continuation, so do not smooth across it.
     if (!this.hasPose || dt > 0.4) {
       this.rotationFilter.reset()
       this.twistGate.reset()
       this.centreGate.reset()
+      this.rulerGate.reset()
       this._depthSettled = false
+      this._warm = false
+      this._steadyCount = 0
+    }
+    // The size became unknown mid-track (Re-measure): hide the jewellery
+    // again until the wrist is measured afresh, as for a new track.
+    if (this._warm && !this.geometry.sizeKnown) {
       this._warm = false
       this._steadyCount = 0
     }
@@ -202,6 +243,7 @@ export class WristTracker {
     // space (a 5 % change is a 5 % change at any distance), and harder.
     const p = this._armRulerDepth(observation)
     const depth = Math.max(50, -p.z)
+    this.depthMeasurementMm = depth
     this._tmpPos[0] = p.x / depth
     this._tmpPos[1] = p.y / depth
     const onScreen = this.positionFilter.filter(this._tmpPos, t)
@@ -231,6 +273,17 @@ export class WristTracker {
 
     // --- Geometry ----------------------------------------------------------
     this.geometry.ingest(observation)
+    {
+      const g = this.geometry
+      if (!(this._shapeW > 0) || this.tracking.presence < 0.05 || g.remembered) {
+        this._shapeW = g.widthMm
+        this._shapeD = g.depthMm
+      } else {
+        const step = SHAPE_GLIDE_MM_S * (dt > 0 ? Math.min(dt, 0.1) : 1 / 30)
+        this._shapeW += clamp(g.widthMm - this._shapeW, -step, step)
+        this._shapeD += clamp(g.depthMm - this._shapeD, -step, step)
+      }
+    }
 
     // The arm's centreline: ONE sideways offset from the wrist landmark to the
     // arm's measured centre, not one per ring. The arm is modelled as a
@@ -270,7 +323,7 @@ export class WristTracker {
         }
       }
     }
-    this.sleeveLimitMm = observation.sleeveLimitMm
+    this.sleeveLimitMm = this.sleeveFilter.filter(observation.sleeveLimitMm, t)
 
     this.twin.handedness = observation.handedness
     // Needed by the fit solver to decide whether a rigid bangle can pass the hand.
@@ -305,6 +358,13 @@ export class WristTracker {
       this.twin.poseConfidence = 0
       return this.twin
     }
+    // No arm to wear anything on until its size is known: the solver's
+    // placeholder shape is nobody's wrist. Physics seated on it was thrown
+    // off the arm when the first real reading grew the arm 20 % around it.
+    if (!this.geometry.sizeKnown) {
+      this.twin.valid = false
+      return this.twin
+    }
 
     const ageMs = clamp(displayTime - this.lastObservationTime, 0, this.tracking.predictionBudgetMs)
     const ahead = PREDICTION_TAU_S * (1 - Math.exp(-ageMs / 1000 / PREDICTION_TAU_S))
@@ -322,9 +382,13 @@ export class WristTracker {
 
     // --- Shape -------------------------------------------------------------
     const g = this.geometry
-    twin.wristWidthMm = g.widthMm
-    twin.wristDepthMm = g.depthMm
-    twin.circumferenceMm = g.circumferenceMm
+    const shapeW = this._shapeW > 0 ? this._shapeW : g.widthMm
+    const shapeD = this._shapeD > 0 ? this._shapeD : g.depthMm
+    twin.wristWidthMm = shapeW
+    twin.wristDepthMm = shapeD
+    twin.circumferenceMm = g.manualCircumferenceMm || Math.abs(shapeW - g.widthMm) + Math.abs(shapeD - g.depthMm) < 0.05
+      ? g.circumferenceMm
+      : ellipseCircumference(shapeW / 2, shapeD / 2)
     twin.shapeLocked = g.locked
     twin.sleeveLimitMm = this.sleeveLimitMm
 
@@ -342,8 +406,8 @@ export class WristTracker {
     // frozen), widening up the arm at the measured anatomical rate. Nothing
     // else about its shape is taken from any single frame, so the tube can
     // only move rigidly with the arm - it cannot flex, bulge or wobble.
-    const aRef = g.widthMm / 2
-    const bRef = g.depthMm / 2
+    const aRef = shapeW / 2
+    const bRef = shapeD / 2
     const refTaper = 1 + REFERENCE_S_MM * FOREARM_TAPER_PER_MM
     for (let i = 0; i < twin.crossSections.length; i++) {
       const sec = twin.crossSections[i]
@@ -404,8 +468,10 @@ export class WristTracker {
     const g = this.geometry
     const station = observation.armWidthStationMm ?? 20
     const ratio = (1 + station * FOREARM_TAPER_PER_MM) / (1 + REFERENCE_S_MM * FOREARM_TAPER_PER_MM)
-    const a = (g.widthMm / 2) * ratio
-    const b = (g.depthMm / 2) * ratio
+    // The shape the tube is drawn with (glided), so the drawn arm keeps the
+    // measured pixel width while the shape estimate refines.
+    const a = ((this._shapeW > 0 ? this._shapeW : g.widthMm) / 2) * ratio
+    const b = ((this._shapeD > 0 ? this._shapeD : g.depthMm) / 2) * ratio
     // The filtered frame, not this observation's: the apparent width depends
     // on the roll, and a jittery roll became a jittery depth.
     const basis = this.basis
@@ -415,13 +481,20 @@ export class WristTracker {
     const apparentMm = 2 * Math.hypot(a * basis.x.dot(_perp), b * basis.z.dot(_perp))
     const depthArm = (this.camera.focalPx * apparentMm) / widthPx
     if (!(depthArm > 50 && depthArm < 3000)) return p
+    // A reading far from the last one waits for the next outline to agree;
+    // meanwhile the correction already established stands, as between outlines.
+    const reading = Math.log(depthArm / depthPalm)
+    if (this.rulerGate.filter(reading) !== reading) {
+      if (!this._rulerLog) return p
+      return this._rulerPoint.copy(p).multiplyScalar(Math.exp(this._rulerLog))
+    }
     // Trust the ruler by the outline fit's confidence only. An unfinished
     // wrist-shape estimate does not argue for the palm's depth instead: with
     // the ruler the rendered arm matches the arm on screen whatever the shape
     // estimate, and only the ring-to-arm proportion inherits its error - as
     // it would with the palm's depth too.
     const w = clamp(observation.armWidthConfidence * ARM_RULER_GAIN, 0, ARM_RULER_MAX)
-    const correction = w * Math.log(depthArm / depthPalm)
+    const correction = w * reading
     if (!this._depthSettled && w >= RULER_SNAP_WEIGHT) {
       this._depthSettled = true
       this._snapDepth = true
@@ -448,7 +521,7 @@ export class WristTracker {
     if (this._warm) return
     this._steadyCount = steady ? this._steadyCount + 1 : 0
     this.tracking.hold = true
-    if (this._steadyCount < WARMUP_FRAMES) return
+    if (this._steadyCount < WARMUP_FRAMES || !this.geometry.sizeKnown) return
     this._warm = true
     this.tracking.hold = false
     this.positionFilter.reset()
@@ -456,6 +529,7 @@ export class WristTracker {
     this.rotationFilter.reset()
     this.twistGate.reset()
     this.centreGate.reset()
+    this.rulerGate.reset()
     this.centreFilter.reset()
     this._hasCentre = false
     this.hasPose = false // no velocity or spin across the restart

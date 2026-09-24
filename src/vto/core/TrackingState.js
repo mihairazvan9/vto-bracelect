@@ -67,7 +67,10 @@ export class TrackingStateMachine {
     }
     this.state = next
 
-    const target = next === TrackingState.LOST || this.hold ? 0 : next === TrackingState.DEGRADED ? 0.65 : 1
+    // Solid or gone, never see-through: DEGRADED used to fade the piece to
+    // 65 %, and a translucent jewel reads as a rendering glitch, not as
+    // caution. The pose is still predicted there; the UI says tracking is weak.
+    const target = next === TrackingState.LOST || this.hold ? 0 : 1
     const rate = target > this.presence ? dt / (this.fadeInMs / 1000) : dt / (this.fadeOutMs / 1000)
     this.presence += Math.sign(target - this.presence) * Math.min(Math.abs(target - this.presence), rate)
     this.presence = Math.max(0, Math.min(1, this.presence))

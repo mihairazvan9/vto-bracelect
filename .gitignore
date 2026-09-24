@@ -47,3 +47,6 @@ tools/eval/node_modules
 tools/eval/gt
 tools/eval/out
 tools/eval/gt-log.txt
+
+# Scorecard results (numbers only, regenerated locally)
+.scorecard/

@@ -26,8 +26,19 @@ export class PerceptionSystem {
     this.segIntervalMs = 1000 / 12
     this.lastHandTime = -Infinity
     this.lastSegTime = -Infinity
-    /** Per-frame detection budget. Anything left over belongs to the renderer. */
-    this.frameBudgetMs = 14
+    /**
+     * Per-camera-frame detection budget, ms. The hand always runs when due;
+     * the arm network joins it only if its recent cost still fits. At 14 ms
+     * the network (15-23 ms at 720p) regularly took the hand's slot and the
+     * hand was detected at 18 Hz off a 30 fps camera; at 28 ms hand (~11 ms)
+     * plus network (~20 ms) did not fit and the network fell to 6 Hz. A
+     * camera frame lasts 33 ms, and the jewellery only changes when one
+     * arrives, so spending most of it on detection costs at most a repeated
+     * display frame.
+     */
+    this.frameBudgetMs = 32
+    /** Recent cost of each stage, ms (for the budget decision). */
+    this._segCost = 18
 
     this.hands = null
     this.handTimestamp = 0
@@ -90,14 +101,17 @@ export class PerceptionSystem {
   }
 
   /**
-   * Run whatever is due, within a time budget.
+   * Run whatever is due on this camera frame.
    *
-   * Stages are only eligible on a new video frame, so the total detection rate
-   * is capped by the camera. Running just ONE stage per frame therefore caps
-   * hand + segmentation together at the camera rate, and since they want 40
-   * slots a second between them they starve each other — segmentation was
-   * landing at 3 Hz. Draining every due stage while the budget lasts lets both
-   * hit their target rate, and the budget still protects the render loop.
+   * The hand goes first whenever it is due: it IS the pose, and every frame
+   * it misses is a frame the bracelet is predicted instead of measured. The
+   * arm network runs after it, when its recent cost still fits the frame's
+   * budget - or regardless, once it is two intervals late, so it can never
+   * be starved outright (a stale mask is refused downstream anyway).
+   *
+   * (Picking the most overdue stage instead let the network, due less often
+   * but always "more overdue" when it was, take the hand's frame: on a 30 fps
+   * camera the hand ran at 18 Hz.)
    */
   process(video, timestampMs) {
     if (!this.ready) return
@@ -105,39 +119,18 @@ export class PerceptionSystem {
     this.videoHeight = video.videoHeight
     const start = performance.now()
 
-    for (let i = 0; i < 2; i++) {
-      const stage = this._pickStage(timestampMs)
-      if (!stage) break
-      this._runStage(stage, video, timestampMs)
-      if (performance.now() - start >= this.frameBudgetMs) break
-    }
-  }
-
-  /**
-   * Which stage is most overdue. A fixed priority order would let the cheapest
-   * stage starve the others whenever the frame rate dips.
-   */
-  _pickStage(timestampMs) {
-    const overdue = (last, interval) => (timestampMs - last) / interval
-
-    let stage = null
-    let worst = 1
-
-    const handRatio = overdue(this.lastHandTime, this.handIntervalMs)
-    if (handRatio >= worst) {
-      worst = handRatio
-      stage = 'hand'
+    if (timestampMs - this.lastHandTime >= this.handIntervalMs * 0.8) {
+      this._runStage('hand', video, timestampMs)
     }
     // The arm network looks at the wrist crop, so it has nothing to do until
     // there is a hand to crop around.
-    if (this.segmenter && this.handGeometry) {
-      const r = overdue(this.lastSegTime, this.segIntervalMs)
-      if (r >= worst) {
-        worst = r
-        stage = 'seg'
-      }
+    if (!this.segmenter || !this.handGeometry) return
+    const overdue = (timestampMs - this.lastSegTime) / this.segIntervalMs
+    if (overdue < 1) return
+    const spent = performance.now() - start
+    if (overdue >= 2 || spent + this._segCost <= this.frameBudgetMs) {
+      this._runStage('seg', video, timestampMs)
     }
-    return stage
   }
 
   _runStage(stage, video, timestampMs) {
@@ -166,6 +159,7 @@ export class PerceptionSystem {
         console.warn('[VTO] segmentation failed', err)
       }
       this.stats.segMs = performance.now() - t0
+      this._segCost += (this.stats.segMs - this._segCost) * 0.3
       this._tickRate(this._segHzStat, timestampMs, 'segHz')
       this.lastSegTime = timestampMs
     }

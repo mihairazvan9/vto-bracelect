@@ -35,6 +35,7 @@ export class CameraStream {
     this.frameMeta = null
     this._metaAt = -Infinity
     this._lastPresented = -1
+    this._arrivals = []
     this._frameWatch = 0
   }
 
@@ -59,6 +60,22 @@ export class CameraStream {
     return this._timeSource ?? 'render'
   }
 
+  /**
+   * Frames per second the camera is actually delivering (over the last ~30
+   * frames), or 0 when unknown. Webcams quietly halve it in dim light.
+   */
+  get cameraFps() {
+    const a = this._arrivals
+    if (a.length < 6 || performance.now() - a[a.length - 1] > 500) return 0
+    return ((a.length - 1) * 1000) / (a[a.length - 1] - a[0])
+  }
+
+  /** What the browser says the track is running at: width, height, frameRate. */
+  get trackSettings() {
+    const s = this.stream?.getVideoTracks?.()[0]?.getSettings?.()
+    return s ? { width: s.width, height: s.height, frameRate: s.frameRate } : null
+  }
+
   /** Keep frameMeta current, for as long as this stream is the live one. */
   _watchFrames() {
     const video = this.video
@@ -68,6 +85,8 @@ export class CameraStream {
       if (generation !== this._frameWatch || !this.stream) return
       this.frameMeta = meta
       this._metaAt = performance.now()
+      this._arrivals.push(this._metaAt)
+      if (this._arrivals.length > 31) this._arrivals.shift()
       video.requestVideoFrameCallback(onFrame)
     }
     video.requestVideoFrameCallback(onFrame)
@@ -110,6 +129,7 @@ export class CameraStream {
     this.frameMeta = null
     this._metaAt = -Infinity
     this._lastPresented = -1
+    this._arrivals = []
     this._timeSource = null
     this._watchFrames()
     return this

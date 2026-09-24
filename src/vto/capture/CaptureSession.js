@@ -9,8 +9,16 @@ const DEG = 180 / Math.PI
 const SETTLE_S = 0.8
 /** Countdown; its frames are recorded too (warm-up for the replay), s. */
 const COUNTDOWN_S = 2.4
-/** A take needs at least this much recording after the countdown, s. */
-const MIN_RECORD_S = 3
+/**
+ * A take needs at least this much recording after the countdown, s. At 3 s a
+ * brisk swing or depth move finished in ~30 frames: too little to measure.
+ */
+const MIN_RECORD_S = 6
+/**
+ * Below this many recorded frames per second the clip no longer shows what
+ * the tracker does at camera rate. Recorded anyway, but flagged.
+ */
+const MIN_GOOD_FPS = 24
 /** Recording continues this long after the requirement is met, s. */
 const TAIL_S = 0.6
 /** Hand gone this long ends the take. Brief dropouts are kept: they are real. */
@@ -54,7 +62,10 @@ export class CaptureSession {
     this.results = {}
     this.queue = []
     this.message = ''
+    this.rateNote = ''
     this._frames = []
+    this._sampleTimes = []
+    this._perf = { recordedFps: [], cameraFps: [] }
     this._canvas = null
     this._budget = null
     this._lastEval = null
@@ -136,7 +147,7 @@ export class CaptureSession {
     if (this._budget) return
     this._budget = { hand: p.handIntervalMs, frame: p.frameBudgetMs }
     p.setBudget({ handHz: 60 })
-    p.frameBudgetMs = 30
+    p.frameBudgetMs = Math.max(p.frameBudgetMs, 34)
   }
 
   _restoreBudget() {
@@ -154,6 +165,7 @@ export class CaptureSession {
     if (!this.scenario || this.status === 'saving' || this.status === 'done' || this.status === 'idle') return
     const t = sample.captureTimeMs / 1000
     const judged = this.coach.evaluate(sample)
+    this._rateCheck(judged, sample.captureTimeMs)
     this._lastEval = judged
     if (this._since === null) this._since = t
 
@@ -206,6 +218,29 @@ export class CaptureSession {
     this._publish(judged)
   }
 
+  /**
+   * How many frames per second actually reach the recording, and if too few,
+   * whose fault it is: a camera that slowed itself down (dim light) or a
+   * computer that cannot process every frame. Adds a soft check; never blocks.
+   */
+  _rateCheck(judged, tMs) {
+    const times = this._sampleTimes
+    times.push(tMs)
+    while (times.length > 16) times.shift()
+    this.rateNote = ''
+    if (times.length < 8) return
+    const fps = ((times.length - 1) * 1000) / Math.max(1, times[times.length - 1] - times[0])
+    const cameraFps = this.engine.stream.cameraFps
+    this._perf.recordedFps.push(fps)
+    if (cameraFps > 0) this._perf.cameraFps.push(cameraFps)
+    const ok = fps >= MIN_GOOD_FPS
+    judged.checks.push({ id: 'rate', label: `${Math.round(fps)} fps`, ok, soft: true })
+    if (ok) return
+    this.rateNote = cameraFps > 0 && cameraFps < MIN_GOOD_FPS
+      ? `The camera is sending only ${Math.round(cameraFps)} fps - usually low light. More light brings it back to 30.`
+      : `Only ${Math.round(fps)} of ${Math.round(cameraFps) || '?'} camera fps are processed - the computer is busy. Close other tabs and apps.`
+  }
+
   _track(judged, t) {
     const dt = this._lastT === undefined ? 0 : Math.min(0.2, Math.max(0, t - this._lastT))
     this._lastT = t
@@ -225,6 +260,8 @@ export class CaptureSession {
   /** Forget everything about the take in progress. */
   _resetTake() {
     this._frames = []
+    this._perf = { recordedFps: [], cameraFps: [] }
+    this._sampleTimes.length = 0
     this._lastT = undefined
     this._handGapS = 0
     this._badFramingS = 0
@@ -275,6 +312,7 @@ export class CaptureSession {
     const scenario = this.scenario
     const frames = this._frames
     const result = this._progress.summary()
+    const perf = this._perfSummary()
     this._resetTake()
     this.status = 'saving'
     this.message = 'Saving...'
@@ -303,6 +341,8 @@ export class CaptureSession {
         fovSource: cam.fovSource,
         mirroredPreview: cam.mirrored,
         timeSource: this.engine.stream.frameTimeSource,
+        /** Conditions of the take: a 15 fps clip measures something else than a 30 fps one. */
+        performance: perf,
         frames: frames.length,
         durationS: (frames[frames.length - 1].tMs - first) / 1000,
         /** Index of the first frame after the countdown: before it is warm-up. */
@@ -332,6 +372,21 @@ export class CaptureSession {
       this.results[scenario.id] = { state: 'error', message: this.message }
     }
     if (this.status === 'saving') this._next()
+  }
+
+  _perfSummary() {
+    const mean = (a) => (a.length ? +(a.reduce((s, x) => s + x, 0) / a.length).toFixed(1) : null)
+    const d = this.engine.diagnostics
+    return {
+      recordedFps: mean(this._perf.recordedFps),
+      cameraFps: mean(this._perf.cameraFps),
+      track: this.engine.stream.trackSettings,
+      renderFps: d.fps,
+      handMs: d.handMs,
+      segHz: d.segHz,
+      segMs: d.segMs,
+      refineMs: d.refineMs,
+    }
   }
 
   // ----------------------------------------------------------- requirements
@@ -452,13 +507,21 @@ export class CaptureSession {
         break
       }
       case 'flick': {
-        if (usable) {
+        // A shake is a back-and-forth: fast motion that reverses at least
+        // twice. One fast frame is not one - the tracker's own start-up jump
+        // once counted as the shake, and the clip ended mid-shake.
+        const settled = tr.presence >= 0.99 && t - this._recordStart > 0.5
+        if (usable && settled) {
           p.peak = Math.max(p.peak, speed)
-          if (!p.shaken && (speed >= need.speedMmS || spin >= 5)) p.shaken = true
+          if (!p.shaken && speed >= need.speedMmS * 0.5) {
+            if (p.lastDir && tr.velocity.dot(p.lastDir) < 0) p.reversals = (p.reversals ?? 0) + 1
+            p.lastDir = (p.lastDir ?? new THREE.Vector3()).copy(tr.velocity)
+          }
+          if (!p.shaken && p.peak >= need.speedMmS && (p.reversals ?? 0) >= 2) p.shaken = true
           if (p.shaken) p.hold = still ? p.hold + dt : 0
         }
         p.value = p.shaken ? 0.35 + 0.65 * Math.min(1, p.hold / need.holdS) : Math.min(0.3, (p.peak / need.speedMmS) * 0.3)
-        p.text = p.shaken ? `Holding still ${p.hold.toFixed(1)} of ${need.holdS} s` : 'Waiting for a quick shake'
+        p.text = p.shaken ? `Holding still ${p.hold.toFixed(1)} of ${need.holdS} s` : `Shake: ${p.reversals ?? 0} of 2 back-and-forths`
         p.hint = p.shaken ? (still ? 'Hold perfectly still' : 'Now hold still') : 'Shake your wrist quickly'
         p.shortfall = p.shaken ? 'Hold still longer after the shake' : 'Shake faster'
         break
@@ -495,7 +558,7 @@ export class CaptureSession {
     return {
       active: false, status: 'idle', scenarioId: null, title: '', instruction: '', why: '',
       prompt: null, arrow: null, checks: [], progress: 0, progressText: '', countdown: 0,
-      frames: 0, message: '', results: {},
+      frames: 0, message: '', rateNote: '', results: {},
     }
   }
 
@@ -512,6 +575,7 @@ export class CaptureSession {
     v.checks = judged?.checks ?? []
     v.frames = this._frames.length
     v.message = this.message
+    v.rateNote = this.rateNote
     v.results = { ...this.results }
     v.progress = this.status === 'recording' ? this._progress?.value ?? 0 : 0
     v.progressText = this.status === 'recording' ? this._progress?.text ?? '' : ''

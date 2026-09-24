@@ -38,10 +38,8 @@ async function loadClip(id) {
     const bmp = await createImageBitmap(new Blob([fr.payload], { type: 'image/jpeg' }))
     const c = new OffscreenCanvas(bmp.width, bmp.height)
     c.getContext('2d').drawImage(bmp, 0, 0)
-    // Let the canvas stand in for the <video> element the app code expects.
-    c.videoWidth = bmp.width
-    c.videoHeight = bmp.height
-    frames.push({ canvas: c, lm: fr.landmarks, W: bmp.width, H: bmp.height })
+    // One camera frame as the app code takes it (CameraStream.takeFrame).
+    frames.push({ canvas: c, frame: { image: c, width: bmp.width, height: bmp.height }, lm: fr.landmarks, W: bmp.width, H: bmp.height })
   }
   return frames.length
 }
@@ -121,9 +119,9 @@ async function runApp(segEvery) {
     if (!f.lm.some((p) => p.x || p.y)) { masks.push(null); continue }
     const t0 = performance.now()
     const geom = ArmSegmenter.geometry(f.lm, f.W, f.H)
-    if (i % segEvery === 0) arm.segment(multiclass, f.canvas, ++ts, geom)
+    if (i % segEvery === 0) arm.segment(multiclass, f.frame, ++ts, geom)
     arm.netTime = t - (i % segEvery) * 33 // network age in the replay's clock
-    arm.refine(f.canvas, t, geom)
+    arm.refine(f.frame, t, geom)
     ms += performance.now() - t0
     const out = new Uint8Array(f.W * f.H)
     for (let y = 0; y < f.H; y++) {

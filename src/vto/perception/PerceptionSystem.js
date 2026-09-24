@@ -22,7 +22,11 @@ export class PerceptionSystem {
 
     // Independent budgets: hand landmarks move every frame; the arm network
     // runs slower because the per-frame refinement carries it in between.
-    this.handIntervalMs = 1000 / 30
+    // The hand runs on every camera frame up to 60 fps: a frame it skips is
+    // drawn with a predicted pose, which is exactly where the bracelet stops
+    // sticking to the arm. (At 30 Hz, a 60 fps camera had every other frame
+    // predicted.)
+    this.handIntervalMs = 1000 / 60
     this.segIntervalMs = 1000 / 12
     this.lastHandTime = -Infinity
     this.lastSegTime = -Infinity
@@ -109,18 +113,21 @@ export class PerceptionSystem {
    * budget - or regardless, once it is two intervals late, so it can never
    * be starved outright (a stale mask is refused downstream anyway).
    *
+   * @param {{image: TexImageSource, width: number, height: number}} frame
+   *        one camera frame (CameraStream.takeFrame); every stage reads it
+   *
    * (Picking the most overdue stage instead let the network, due less often
    * but always "more overdue" when it was, take the hand's frame: on a 30 fps
    * camera the hand ran at 18 Hz.)
    */
-  process(video, timestampMs) {
+  process(frame, timestampMs) {
     if (!this.ready) return
-    this.videoWidth = video.videoWidth
-    this.videoHeight = video.videoHeight
+    this.videoWidth = frame.width
+    this.videoHeight = frame.height
     const start = performance.now()
 
     if (timestampMs - this.lastHandTime >= this.handIntervalMs * 0.8) {
-      this._runStage('hand', video, timestampMs)
+      this._runStage('hand', frame, timestampMs)
     }
     // The arm network looks at the wrist crop, so it has nothing to do until
     // there is a hand to crop around.
@@ -129,17 +136,17 @@ export class PerceptionSystem {
     if (overdue < 1) return
     const spent = performance.now() - start
     if (overdue >= 2 || spent + this._segCost <= this.frameBudgetMs) {
-      this._runStage('seg', video, timestampMs)
+      this._runStage('seg', frame, timestampMs)
     }
   }
 
-  _runStage(stage, video, timestampMs) {
+  _runStage(stage, frame, timestampMs) {
     if (stage === 'hand') {
       const t0 = performance.now()
       try {
-        this.hands = this.handLandmarker.detectForVideo(video, timestampMs)
+        this.hands = this.handLandmarker.detectForVideo(frame.image, timestampMs)
         this.handTimestamp = timestampMs
-        this.handGeometry = ArmSegmenter.geometry(this.hands?.landmarks?.[0], video.videoWidth, video.videoHeight)
+        this.handGeometry = ArmSegmenter.geometry(this.hands?.landmarks?.[0], frame.width, frame.height)
         if (!this.handGeometry) this.arm.reset()
         this.revision++
       } catch (err) {
@@ -154,7 +161,7 @@ export class PerceptionSystem {
     if (stage === 'seg') {
       const t0 = performance.now()
       try {
-        this.arm.segment(this.segmenter, video, timestampMs, this.handGeometry)
+        this.arm.segment(this.segmenter, frame, timestampMs, this.handGeometry)
       } catch (err) {
         console.warn('[VTO] segmentation failed', err)
       }
@@ -179,8 +186,8 @@ export class PerceptionSystem {
    * frame, after process(): cheap (~2-3 ms), and it is what keeps the mask
    * describing THIS frame while the network runs at a lower rate.
    */
-  refineArm(video, timestampMs) {
-    this.arm.refine(video, timestampMs, this.handGeometry)
+  refineArm(frame, timestampMs) {
+    this.arm.refine(frame, timestampMs, this.handGeometry)
     this.stats.refineMs = this.arm.stats.refineMs
   }
 

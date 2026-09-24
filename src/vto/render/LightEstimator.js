@@ -57,15 +57,15 @@ export class LightEstimator {
   }
 
   /**
-   * @param {HTMLVideoElement} video
+   * @param {{image: CanvasImageSource, width: number, height: number}} frame  the camera frame (CameraStream.takeFrame)
    * @param {{x:number,y:number,r:number}|null} wristRegion  normalised crop of the wrist
    */
-  update(video, wristRegion, nowMs, mirrored) {
-    if (!this.enabled || !video.videoWidth) return
+  update(frame, wristRegion, nowMs, mirrored) {
+    if (!this.enabled || !frame.width) return
     if (nowMs - this._lastSample < this.sampleIntervalMs) return
     this._lastSample = nowMs
 
-    this.sampleCtx.drawImage(video, 0, 0, SAMPLE_W, SAMPLE_H)
+    this.sampleCtx.drawImage(frame.image, 0, 0, SAMPLE_W, SAMPLE_H)
     let data
     try {
       data = this.sampleCtx.getImageData(0, 0, SAMPLE_W, SAMPLE_H).data
@@ -130,7 +130,7 @@ export class LightEstimator {
     this.exposure = THREE.MathUtils.clamp(0.85 + (0.45 - meanL) * 0.5, 0.7, 1.25)
 
     if (nowMs - this._lastEnvUpdate > this.envIntervalMs) {
-      this._buildEnvironment(video, wristRegion, data, meanR, meanG, meanB)
+      this._buildEnvironment(frame, wristRegion, data, meanR, meanG, meanB)
       this._lastEnvUpdate = nowMs
     }
   }
@@ -141,7 +141,7 @@ export class LightEstimator {
    * Cheap, but it is the difference between gold that reflects a studio and gold
    * that reflects the room the user is actually standing in.
    */
-  _buildEnvironment(video, wristRegion, data, meanR, meanG, meanB) {
+  _buildEnvironment(frame, wristRegion, data, meanR, meanG, meanB) {
     const ctx = this.envCtx
 
     // Average the top and bottom thirds of the frame separately.
@@ -174,15 +174,15 @@ export class LightEstimator {
 
     // Local skin bounce: sample the actual wrist crop and smear it into the
     // lower-front of the environment, where a bracelet would see it.
-    if (wristRegion && video.videoWidth) {
-      const px = wristRegion.x * video.videoWidth
-      const py = wristRegion.y * video.videoHeight
-      const pr = Math.max(8, wristRegion.r * video.videoWidth)
+    if (wristRegion && frame.width) {
+      const px = wristRegion.x * frame.width
+      const py = wristRegion.y * frame.height
+      const pr = Math.max(8, wristRegion.r * frame.width)
       ctx.save()
       ctx.globalAlpha = 0.55
       ctx.filter = 'blur(6px)'
       ctx.drawImage(
-        video,
+        frame.image,
         Math.max(0, px - pr), Math.max(0, py - pr), pr * 2, pr * 2,
         ENV_W * 0.28, ENV_H * 0.58, ENV_W * 0.44, ENV_H * 0.42,
       )

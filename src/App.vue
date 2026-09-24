@@ -32,7 +32,7 @@ const diagnostics = reactive({
   jitterPx: 0, jitterDeg: 0, breathingPct: 0, sleeveLimitMm: Infinity,
   rollDeg: 0, dorsalAgreement: 0, angularSpeedDeg: 0,
   reprojectionPx: 0, forearmCorrectionDeg: 0, forearmFromSilhouette: false, refineMs: 0, maskActive: false,
-  cameraFps: 0,
+  cameraFps: 0, frameMs: 0, latencyMs: 0,
 })
 const options = reactive({
   lightEstimation: true,
@@ -42,6 +42,7 @@ const options = reactive({
   showSegmentation: false,
   showWalls: false,
   physicsLiveliness: DEFAULT_LIVELINESS,
+  frameLock: true,
 })
 const fits = ref([])
 

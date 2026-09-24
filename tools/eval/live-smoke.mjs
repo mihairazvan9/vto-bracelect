@@ -81,7 +81,7 @@ try {
     samples.push(await page.evaluate(() => {
       const d = window.__vto.diagnostics
       return {
-        fps: d.fps, state: d.state, handHz: d.handHz, handMs: d.handMs, segHz: d.segHz, segMs: d.segMs,
+        frameSource: window.__vto._frame?.image?.constructor?.name, fps: d.fps, cameraFps: d.cameraFps, frameMs: d.frameMs, latencyMs: d.latencyMs, state: d.state, handHz: d.handHz, handMs: d.handMs, segHz: d.segHz, segMs: d.segMs,
         refineMs: d.refineMs, maskActive: d.maskActive, sil: d.forearmFromSilhouette, silConf: d.silhouetteConfidence,
         joint: d.forearmCorrectionDeg, width: d.wristWidthMm, jitterPx: d.jitterPx, jitterDeg: d.jitterDeg,
         fov: d.fovYDeg, fovSource: d.fovSource,
@@ -95,6 +95,7 @@ try {
   await browser.close()
   await server.close()
 }
+console.log(`GL/driver messages filtered: ${errors.filter((e) => /GL Driver Message|WebGL: INVALID|gpu|OpenGL/i.test(e)).length}`)
 const relevant = errors.filter((e) => !/GL Driver Message|WebGL: INVALID|gpu|OpenGL/i.test(e))
 console.log(`\nconsole errors/warnings: ${relevant.length}`)
 relevant.slice(0, 15).forEach((e) => console.log('  ' + e.slice(0, 300)))

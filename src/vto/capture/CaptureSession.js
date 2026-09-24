@@ -272,9 +272,9 @@ export class CaptureSession {
   // ------------------------------------------------------------- recording
 
   _record(sample, judged) {
-    const video = sample.video
-    const vw = video.videoWidth
-    const vh = video.videoHeight
+    const frame = sample.frame
+    const vw = frame.width
+    const vh = frame.height
     const scale = Math.min(1, ANALYSIS_MAX_W / vw)
     const aw = Math.round(vw * scale)
     const ah = Math.round(vh * scale)
@@ -283,7 +283,7 @@ export class CaptureSession {
       this._ctx = this._canvas.getContext('2d')
     }
     // The RAW frame (no mirroring, no jewellery): exactly what MediaPipe saw.
-    this._ctx.drawImage(video, 0, 0, aw, ah)
+    this._ctx.drawImage(frame.image, 0, 0, aw, ah)
     const jpeg = this._canvas.convertToBlob({ type: 'image/jpeg', quality: JPEG_QUALITY })
 
     const hands = sample.hands

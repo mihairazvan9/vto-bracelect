@@ -98,9 +98,9 @@ export class ArmSegmenter {
   }
 
   /** Run the network on the wrist crop. Call at the segmentation rate. */
-  segment(segmenter, video, timestampMs, geom) {
-    const vw = video.videoWidth
-    const vh = video.videoHeight
+  segment(segmenter, frame, timestampMs, geom) {
+    const vw = frame.width
+    const vh = frame.height
     if (!segmenter || !geom || !vw) return false
     const size = geom.palm * CROP_PALMS
     const cx = geom.wx + geom.ax * geom.palm * CROP_BIAS
@@ -110,7 +110,7 @@ export class ArmSegmenter {
     const g = this.netCtx
     g.fillStyle = '#000'
     g.fillRect(0, 0, NET_SIZE, NET_SIZE)
-    drawCrop(g, video, crop, vw, vh, NET_SIZE)
+    drawCrop(g, frame.image, crop, vw, vh, NET_SIZE)
 
     let ok = false
     segmenter.segmentForVideo(this.netCanvas, timestampMs, (result) => {
@@ -138,9 +138,9 @@ export class ArmSegmenter {
    * Refine for the current camera frame. Call once per new video frame.
    * @returns {boolean} whether a mask is available for this frame
    */
-  refine(video, timestampMs, geom) {
-    const vw = video.videoWidth
-    const vh = video.videoHeight
+  refine(frame, timestampMs, geom) {
+    const vw = frame.width
+    const vh = frame.height
     this.videoWidth = vw
     this.videoHeight = vh
     if (!geom || !this.hasNet || timestampMs - this.netTime > MAX_NET_AGE_MS) {
@@ -158,7 +158,7 @@ export class ArmSegmenter {
 
     const g = this.roiCtx
     g.clearRect(0, 0, ROI_SIZE, ROI_SIZE)
-    drawCrop(g, video, roi, vw, vh, ROI_SIZE)
+    drawCrop(g, frame.image, roi, vw, vh, ROI_SIZE)
     let rgba
     try {
       rgba = g.getImageData(0, 0, ROI_SIZE, ROI_SIZE).data
@@ -237,7 +237,7 @@ function makeCanvas(w, h) {
  * region beyond the frame is left as is (cleared by the caller), with the
  * visible part placed exactly where it belongs.
  */
-function drawCrop(g, video, crop, vw, vh, size) {
+function drawCrop(g, image, crop, vw, vh, size) {
   const sx0 = Math.max(0, crop.x)
   const sy0 = Math.max(0, crop.y)
   const sx1 = Math.min(vw, crop.x + crop.size)
@@ -245,7 +245,7 @@ function drawCrop(g, video, crop, vw, vh, size) {
   if (sx1 <= sx0 || sy1 <= sy0) return
   const k = size / crop.size
   g.drawImage(
-    video,
+    image,
     sx0, sy0, sx1 - sx0, sy1 - sy0,
     (sx0 - crop.x) * k, (sy0 - crop.y) * k, (sx1 - sx0) * k, (sy1 - sy0) * k,
   )

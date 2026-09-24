@@ -21,9 +21,13 @@ const TARGETS = {
     <header class="panel__head"><h2>Engine</h2></header>
 
     <div class="grid">
-      <div class="cell">
-        <span>FPS</span>
-        <strong>{{ diagnostics.fps }}</strong>
+      <div class="cell" title="Images actually drawn per second, and the rate the camera delivers">
+        <span>Drawn / camera</span>
+        <strong>{{ diagnostics.fps }} · {{ diagnostics.cameraFps || '?' }} fps</strong>
+      </div>
+      <div class="cell" title="Main-thread time per image; camera capture to image drawn (where the browser reports capture times)">
+        <span>Frame · latency</span>
+        <strong>{{ diagnostics.frameMs }} ms · {{ diagnostics.latencyMs ? `${diagnostics.latencyMs} ms` : '?' }}</strong>
       </div>
       <div class="cell">
         <span>Tracking</span>
@@ -52,6 +56,7 @@ const TARGETS = {
 
     <div class="toggles">
       <label v-for="(label, key) in {
+        frameLock: 'Lock drawing to camera frames',
         lightEstimation: 'Camera light estimation',
         showOccluder: 'Show wrist occluder',
         showWristFrame: 'Show wrist frame (rotation)',

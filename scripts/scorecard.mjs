@@ -10,6 +10,7 @@
  *   npm run scorecard -- --save base.json      keep the numbers
  *   npm run scorecard -- --compare base.json   show the change against them
  *   npm run scorecard -- --realistic           realistic physics mode
+ *   npm run scorecard -- --hz camera           one render per camera frame (the live default)
  *
  * TRACKING (per camera frame, while the jewellery is visible)
  *   roll     second difference of the roll about the forearm, deg: the twitch
@@ -69,7 +70,7 @@ const option = (name) => {
 const realistic = flag('--realistic')
 const savePath = option('--save')
 const comparePath = option('--compare')
-const hz = Number(option('--hz')) || 60
+const hz = option('--hz') === 'camera' ? 'camera' : Number(option('--hz')) || 60
 const optionValues = new Set([savePath, comparePath, option('--hz')].filter(Boolean))
 const only = args.filter((a) => !a.startsWith('--') && !optionValues.has(a))
 
@@ -125,7 +126,10 @@ export function simulate(fixture, { renderHz = 60, pieces = PIECES, real = reali
     return { id, asset, rigid: rigid ? new RigidSolver() : null, chain: rigid ? null : new XPBDChainSolver(), samples: [], frames: [], costMs: 0, solves: 0 }
   })
   const arm = []
-  const renderDtMs = 1000 / renderHz
+  // 'camera': one render per camera frame, physics stepped by the frame's own
+  // spacing - VTOEngine's camera-locked loop (options.frameLock).
+  const locked = renderHz === 'camera'
+  let renderDtMs = locked ? 33 : 1000 / renderHz
   const frameInv = new THREE.Matrix4()
   const frames = fixture.frames
   let t = 1000
@@ -134,8 +138,9 @@ export function simulate(fixture, { renderHz = 60, pieces = PIECES, real = reali
 
   for (let n = 0; n < frames.length; n++) {
     t += frames[n].dtMs || 33
-    if (tick === null) tick = t
+    if (tick === null || locked) tick = t
     const next = t + (frames[n + 1]?.dtMs || frames[n].dtMs || 33)
+    if (locked) renderDtMs = next - t
     const result = handResult(frames[n])
     const source = result ? sources.build(result, cam) : null
     const obs = source ? observer.observe(source, maskPerception(fixture, frames[n]), t) : null
@@ -149,7 +154,8 @@ export function simulate(fixture, { renderHz = 60, pieces = PIECES, real = reali
     let armSample = null
     const firstOf = instances.map(() => null)
     for (let first = true; tick < next; tick += renderDtMs, first = false) {
-      const twin = tracker.update(tick, renderDtMs / 1000, t)
+      const stepS = locked ? Math.min(0.1, Math.max(1 / 240, (frames[n].dtMs || 33) / 1000)) : renderDtMs / 1000
+      const twin = tracker.update(tick, stepS, t)
       if (!twin.valid) {
         for (const inst of instances) inst.samples.push(null)
         continue
@@ -179,8 +185,8 @@ export function simulate(fixture, { renderHz = 60, pieces = PIECES, real = reali
       instances.forEach((inst, i) => {
         const fit = fitSolver.evaluate(inst.asset, twin, 0)
         const t0 = performance.now()
-        if (inst.rigid) inst.rigid.solve(inst.asset, fit, twin, renderDtMs / 1000, { realistic: real })
-        else inst.chain.solve(inst.asset, fit, twin, renderDtMs / 1000, [], { realistic: real })
+        if (inst.rigid) inst.rigid.solve(inst.asset, fit, twin, stepS, { realistic: real })
+        else inst.chain.solve(inst.asset, fit, twin, stepS, [], { realistic: real })
         inst.costMs += performance.now() - t0
         inst.solves++
         const s = shown ? { t: tick, speed: tracker.velocity.length(), spin: tracker.omega.length(), ...samplePiece(inst, fit, frameInv, cam) } : null
@@ -467,7 +473,7 @@ export function main() {
     return `${text} ${mark}${Array.isArray(was) ? f(was[1], d) : f(was, d)}`
   }
 
-  console.log(`physics: ${realistic ? 'realistic' : 'stable'}, render ${hz} Hz${baseline ? `   (compared with ${comparePath}: v better, ^ worse, = same; p95 compared)` : ''}\n`)
+  console.log(`physics: ${realistic ? 'realistic' : 'stable'}, render ${hz === 'camera' ? 'once per camera frame' : `${hz} Hz`}${baseline ? `   (compared with ${comparePath}: v better, ^ worse, = same; p95 compared)` : ''}\n`)
   const W = baseline ? 20 : 14
   const cols = (c, b) => ['roll', 'axis', 'shake', 'pump'].map((k) => cmp(c[k], b?.[k]).padEnd(W)).join('') +
     cmp(c.lag, b?.lag, 1).padEnd(W) + cmp(c.rollErr, b?.rollErr, 1).padEnd(W)

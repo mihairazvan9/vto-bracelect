@@ -424,8 +424,31 @@ shown alongside.
 
 Wrist shape does not change during a session. Once the fit is confident and well-covered,
 the shape is **frozen** and only pose updates. This removes most of the scale breathing that
-makes AR jewellery look fake. Pose is filtered with a 1€ filter and extrapolated with linear
-and angular velocity, so the render loop runs at display rate regardless of detector rate.
+makes AR jewellery look fake. Pose is filtered with a 1€ filter, and predicted with linear
+and angular velocity only across a camera frame the hand detector skipped.
+
+### One camera frame in, one image out
+
+The jewellery can only stick to the arm if the picture and the pose come from the same
+camera frame. Each frame is snapshotted once (`CameraStream.takeFrame`, a `VideoFrame`
+taken in the frame's own `requestVideoFrameCallback`), and the hand detector, the arm
+network, the mask refinement, the lighting and the background texture all read that
+snapshot. Before, each read the live `<video>`: detection takes 15-35 ms, so a newer frame
+often arrived mid-pipeline and the background was drawn a frame ahead of the pose.
+
+The loop then draws exactly once per camera frame (Engine panel: *Lock drawing to camera
+frames*, on by default), with physics advanced by the frame's own spacing. Redrawing at the
+display's 120-180 Hz showed nothing new and took GPU time from the hand detector; the panel's
+fps is now images actually drawn, next to the camera's rate, per-image main-thread time and
+capture-to-draw latency. Live, a 30 fps clip as the webcam: 30 drawn / 30 camera fps, hands at
+30 Hz, ~20-25 ms per image, ~25 ms latency. The hand now runs on every frame up to 60 fps (it
+was capped at 30 Hz, so a 60 fps camera had every other frame predicted).
+
+Measured on the recordings (`npm run scorecard -- --hz camera`), per camera frame on screen:
+tracking is identical (the pose was already per camera frame), rim shake and jumps are equal
+or slightly better. A tennis band's restlessness at rest is not rate-robust in either mode:
+p95 0.5 mm/s at 60 Hz, 7-8 mm/s at 120 Hz and camera-locked alike - an open issue in the
+chain solver, not in the lock.
 
 ### The dorsal axis comes from anatomy, not a label
 

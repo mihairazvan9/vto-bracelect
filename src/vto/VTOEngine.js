@@ -47,9 +47,12 @@ const PALM_MEMORY_SAMPLES = 30
  *   camera -> perception (budgeted) -> wrist observation -> temporal twin
  *          -> fit -> physics -> render (occlusion, contact, lighting)
  *
- * The render loop deliberately runs free of the detector rate: the twin
- * extrapolates, so jewellery is redrawn at display rate even when perception is
- * only managing 25 Hz.
+ * The loop is locked to the camera: each camera frame is snapshotted once,
+ * every stage reads that snapshot, and exactly one image - that frame as the
+ * background, the pose solved for it, physics advanced to it - is drawn for
+ * it. The jewellery can only stick to the arm if both come from the same
+ * frame. (options.frameLock = false keeps redrawing at the display's rate,
+ * the pose still held on the camera frame, for comparison.)
  */
 export class VTOEngine {
   constructor(canvas, { fovYDeg, quality = 'high' } = {}) {
@@ -178,6 +181,10 @@ export class VTOEngine {
       maskActive: false,
       /** Frames per second the camera actually delivers (0 = unknown). */
       cameraFps: 0,
+      /** Main-thread ms per drawn image. */
+      frameMs: 0,
+      /** Camera capture to image submitted, ms (0 = unknown on this browser). */
+      latencyMs: 0,
     }
 
     this.options = {
@@ -194,11 +201,22 @@ export class VTOEngine {
        */
       physicsLiveliness: DEFAULT_LIVELINESS,
       lightEstimation: true,
+      /**
+       * Draw once per camera frame (true), or at the display's refresh rate
+       * with the pose held on the camera frame and only the physics moving
+       * between frames (false).
+       */
+      frameLock: true,
     }
 
     this._running = false
     this._lastFrame = 0
-    this._fpsAccum = []
+    /** When each of the last second's images was drawn (diagnostics). */
+    this._drawTimes = []
+    this._workMs = 0
+    this._latencyMs = 0
+    /** The camera frame on screen (CameraStream.takeFrame); closed when replaced. */
+    this._frame = null
     this._onFrame = this._onFrame.bind(this)
     this._debug = null
     this._lastRevision = -1
@@ -354,20 +372,34 @@ export class VTOEngine {
     if (!this._running) return
     requestAnimationFrame(this._onFrame)
 
-    const dt = clamp((now - this._lastFrame) / 1000, 1 / 240, 1 / 15)
+    const displayDt = clamp((now - this._lastFrame) / 1000, 1 / 240, 1 / 15)
     this._lastFrame = now
 
     if (!this.stream.ready) return
     this._syncResolution()
 
-    // --- Perception (budgeted, may do nothing this frame) ------------------
-    if (this.stream.hasNewFrame()) {
+    // Camera-locked (the default): one image per camera frame, drawn from
+    // that frame alone - its picture, its pose, physics advanced by exactly
+    // the time the arm took to get there. A display refresh with no new
+    // camera frame has nothing new to show, and redrawing it (the loop used to,
+    // at 120-180 Hz) only took GPU time from the hand detector.
+    const fresh = this.stream.hasNewFrame()
+    const locked = this.options.frameLock
+    if (!fresh && locked) return
+    const workStart = performance.now()
+
+    let dt = displayDt
+    // --- Perception: every stage reads the same snapshot of this frame -------
+    if (fresh) {
       const frameTime = this._frameTime(now)
+      if (locked) dt = clamp((frameTime - this._displayTime) / 1000, 1 / 240, 0.1)
       this._displayTime = frameTime
-      this.perception.process(this.stream.video, frameTime)
+      const frame = this.stream.takeFrame()
+      this._showFrame(frame)
+      this.perception.process(frame, frameTime)
       // Refine the arm mask first: the observation below reads the silhouette
       // through it, so it has to describe THIS frame, not the network's last.
-      this.perception.refineArm(this.stream.video, frameTime)
+      this.perception.refineArm(frame, frameTime)
 
       // Re-solve whenever either detector produced something new, not just the
       // hand: in pose-only mode the hand never updates at all.
@@ -399,7 +431,7 @@ export class VTOEngine {
       // camera frame the hand detector ran on, with what it and the arm
       // segmentation made of that frame.
       if (this.capture && this.perception.handTimestamp === frameTime) {
-        this.capture.onFrame(this._captureSample(frameTime, observation))
+        this.capture.onFrame(this._captureSample(frame, frameTime, observation))
       }
     }
 
@@ -427,7 +459,7 @@ export class VTOEngine {
     // --- Lighting -----------------------------------------------------------
     if (this.options.lightEstimation) {
       this.lighting.enabled = true
-      this.lighting.update(this.stream.video, this._wristRegion(twin), now, this.stream.mirrored)
+      if (fresh) this.lighting.update(this._frame, this._wristRegion(twin), now, this.stream.mirrored)
       this.lighting.applyTo(this.scene, this.keyLight, this.ambient, this.renderer)
       if (this.lighting.environment) {
         for (const inst of this.instances) inst.mesh.setEnvironment(this.lighting.environment)
@@ -488,24 +520,38 @@ export class VTOEngine {
     this.renderer.render(this.scene, this.camera)
     this.segmentationDebug.render(this.renderer)
 
-    this._updateDiagnostics(now, dt, twin, presence)
+    this._updateDiagnostics(now, twin, presence, fresh, workStart)
+  }
+
+  /**
+   * Make `frame` the picture behind the jewellery, and release the one it
+   * replaces: that one is already uploaded and never drawn again.
+   */
+  _showFrame(frame) {
+    this.videoTexture.image = frame.image
+    this.videoTexture.needsUpdate = true
+    this._frame?.close()
+    this._frame = frame
   }
 
   _solveStack(twin, dt) {
     // Stacking: each piece gets its own band of forearm so they sit side by side
     // instead of intersecting, then the chains collide with their neighbours.
     let cursor = 0
-    const neighbours = []
     const physics = { liveliness: this.options.physicsLiveliness }
-
     for (let i = 0; i < this.instances.length; i++) {
       const inst = this.instances[i]
       const width = Math.max(inst.asset.stockRadiusMm * 2, inst.asset.links?.widthMm ?? 0)
       const bias = i === 0 ? 0 : cursor
       cursor += width + 1.6
-
       inst.fit = this.fitSolver.evaluate(inst.asset, twin, bias)
+    }
 
+    // The arm's pose is this camera frame's. The solvers step at their own
+    // fixed rates internally (480 / 600 Hz), so a whole camera frame's worth
+    // of dt is simply more internal steps against that pose.
+    const neighbours = []
+    for (const inst of this.instances) {
       if (inst.rigid) {
         inst.rigid.solve(inst.asset, inst.fit, twin, dt, neighbours, physics)
         inst.mesh.applyRigid(inst.rigid, inst.fit)
@@ -581,11 +627,11 @@ export class VTOEngine {
   }
 
   /** What a CaptureSession gets per recorded frame. Valid only during the call. */
-  _captureSample(frameTime, observation) {
+  _captureSample(frame, frameTime, observation) {
     return {
       now: frameTime,
       captureTimeMs: frameTime,
-      video: this.stream.video,
+      frame,
       hands: this.perception.hands,
       armMask: this.perception.armMask,
       roiRgba: this.perception.arm.lastRoiRgba,
@@ -668,13 +714,25 @@ export class VTOEngine {
     }
   }
 
-  _updateDiagnostics(now, dt, twin, presence) {
-    this._fpsAccum.push(dt)
-    if (this._fpsAccum.length > 40) this._fpsAccum.shift()
-    const avg = this._fpsAccum.reduce((a, b) => a + b, 0) / this._fpsAccum.length
-
+  _updateDiagnostics(now, twin, presence, fresh, workStart) {
     const d = this.diagnostics
-    d.fps = Math.round(1 / Math.max(1e-4, avg))
+    const done = performance.now()
+    // Images actually drawn per second over the last second: with the camera
+    // lock that is the camera's rate (less any frame the pipeline could not
+    // keep up with), not the display's refresh rate.
+    const drawn = this._drawTimes
+    drawn.push(done)
+    while (drawn.length && done - drawn[0] > 1000) drawn.shift()
+    d.fps = drawn.length > 1 ? Math.round(((drawn.length - 1) * 1000) / (drawn[drawn.length - 1] - drawn[0])) : 0
+    // Main-thread time spent on this image (perception, solve, draw calls), ms.
+    this._workMs += (done - workStart - this._workMs) * 0.1
+    d.frameMs = +this._workMs.toFixed(1)
+    // Camera capture -> image submitted, ms; known only where the browser
+    // reports capture times. The compositor adds about one display frame.
+    if (fresh && this.stream.frameTimeSource === 'capture') {
+      this._latencyMs += (done - this._displayTime - this._latencyMs) * 0.1
+      d.latencyMs = Math.round(this._latencyMs)
+    }
     d.state = this.tracker.state
     d.presence = presence
     d.handHz = Math.round(this.perception.stats.handHz)
@@ -715,7 +773,10 @@ export class VTOEngine {
   // ------------------------------------------------------------- plumbing
 
   _setupBackground() {
-    this.videoTexture = new THREE.VideoTexture(this.stream.video)
+    // A plain texture fed one snapshot per processed frame (_showFrame), not a
+    // VideoTexture: that one re-reads the live <video> whenever the browser
+    // presents a frame, so the picture ran ahead of the pose computed for it.
+    this.videoTexture = new THREE.Texture()
     this.videoTexture.colorSpace = THREE.SRGBColorSpace
     this.videoTexture.minFilter = THREE.LinearFilter
     this.videoTexture.generateMipmaps = false
@@ -755,7 +816,10 @@ export class VTOEngine {
     this.videoTexture.wrapS = THREE.RepeatWrapping
     this.videoTexture.repeat.x = this.stream.mirrored ? -1 : 1
     this.videoTexture.offset.x = this.stream.mirrored ? 1 : 0
-    this.videoTexture.needsUpdate = true
+    // The GPU texture is allocated at the first frame's size; a new camera
+    // size needs a new allocation, which dispose() forces on the next upload.
+    this.videoTexture.dispose()
+    if (this.videoTexture.image) this.videoTexture.needsUpdate = true
   }
 
   dispose() {
@@ -771,6 +835,8 @@ export class VTOEngine {
     this.occluder.dispose()
     this.lighting.dispose()
     this.videoTexture.dispose()
+    this._frame?.close()
+    this._frame = null
     this.bgQuad.geometry.dispose()
     this.bgQuad.material.dispose()
     this.renderer.dispose()

@@ -209,6 +209,11 @@ export class CameraStream {
       video.frameRate = { ideal: 60 }
       this.stream = await navigator.mediaDevices.getUserMedia({ audio: false, video })
     }
+    // facingMode is only a preference: a laptop asked for the back camera
+    // hands over its webcam. Mirror by the camera we actually got; a webcam
+    // that reports no facing mode faces the user.
+    const actual = this.stream.getVideoTracks()[0]?.getSettings?.().facingMode
+    this.facingMode = actual === 'environment' ? 'environment' : 'user'
     this.video.srcObject = this.stream
     await this.video.play()
     await new Promise((resolve) => {

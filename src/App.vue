@@ -56,7 +56,7 @@ async function start() {
   try {
     const canvas = stage.value.canvas
     const vto = new VTOEngine(canvas, { quality: 'high' })
-    await vto.start({ facingMode: 'user' })
+    await vto.start({ facingMode: 'environment' })
     Object.assign(vto.options, options)
     engine.value = vto
     // Dev builds only: lets the headless smoke test (tools/eval/live-smoke.mjs)

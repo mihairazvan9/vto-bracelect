@@ -65,7 +65,7 @@ through a soft spring, so a real pronation reaches the piece and a tracker twitc
 
 - *Bangle / cuff* (`RigidSolver`): an XPBD rigid body (Müller et al. 2020) - mass, contact
   of 24 points round its inner edge with the tapered arm tube, positional static and kinetic
-  skin friction, a soft bounce, the wall planes, a tasteful tilt limit, sleep when it and the
+  skin friction, a soft bounce, the arm's flares at the hand and elbow, a tasteful tilt limit, sleep when it and the
   arm are at rest. A loose bangle really rests on the top of the wrist, slides when the arm
   tilts past what friction holds, cocks on a slope and jams on the widening arm. A cuff
   springs onto the wrist.
@@ -365,11 +365,28 @@ recorded clips, candidate pipelines run in real Chrome, scored on axis angle and
 - **Bracelet physics** is real rigid-body and XPBD physics with one *liveliness* setting
   (see *Premium pass* above); it replaced a stable mode that capped sag at 1.5 mm and tilt
   at 3 deg.
-- **Invisible walls: two planes at the ends of the arm tube** (`physics/walls.js`, 6 mm
-  and 84 mm up the forearm). The bracelet moves freely between them - it slides along the
-  arm in both physics modes - and can never pass either, so it cannot leave the tube.
-  Physics only: never drawn or occluding (debug: *Show invisible walls* draws the planes).
-  The tube itself now ends just past the start plane instead of reaching 2 cm into the
+- **Invisible walls: the physics arm flares** (`physics/walls.js`). Two planes across the
+  arm used to stop a sliding bracelet, and it stood square against one - resting on
+  nothing. Now, past the wrist, the arm the physics sees widens the way a hand does
+  (0.8 mm of half-width per mm, not thicker - a hand is flat), and toward the elbow it
+  widens gently; a piece is stopped by that surface and rests on its slope, tilted by it
+  (lively physics, hand down: a loose bangle comes to rest 1.5 mm past the crease, on the
+  flare). The squeeze for too-tight pieces never applies to the flares, so nothing
+  squeezes past the hand. Planes remain only as far-out backstops (-25 / 110 mm) that
+  nothing reaches. Physics only: never drawn or occluding (debug: *Show invisible walls*
+  draws the flare as rings of the section the contact solve uses).
+- **Pieces slide freely between the flares.** Every piece used to be pulled back to a fixed
+  resting station (3 /s calm, 0.4 /s lively), and chains were fenced within ~8 mm of it;
+  both are gone (`axialHold: 0`). What holds a piece now is what holds a real one: skin
+  friction, gravity, the arm's motion, the flares. Only a cuff still grips its station - it
+  clamps the wrist. On the recordings pieces got calmer, not busier (bangle jumps 34.7 ->
+  19.9 /min, rest 2.4 -> 1.3 mm/s; charm 52.9 -> 32.3 /min, 4.7 -> 0.3 mm/s; tennis jumps
+  20 -> 32 /min, rest 1.6 -> 1.1): the spring to the station was itself a source of motion.
+  With the hand raised, a loose piece now slides down the forearm to the elbow-side flare.
+  *Tried and dropped:* a detected sleeve as a wall (the far flare starting at its edge) -
+  the sleeve's edge moves, and a flare appearing under a piece launched it (bangle rim p95
+  from 35 px to millions). A sleeve wall needs an edge that moves smoothly first.
+  The tube itself now ends just past the wrist instead of reaching 2 cm into the
   palm.
 - **Loose-ring tilt fixed.** Gravity tilt was largest with the forearm vertical, exactly
   where its axis (forearm x gravity) is undefined, so the ring tipped to an arbitrary
@@ -424,7 +441,19 @@ shown alongside.
 
 Wrist shape does not change during a session. Once the fit is confident and well-covered,
 the shape is **frozen** and only pose updates. This removes most of the scale breathing that
-makes AR jewellery look fake. Pose is filtered with a 1€ filter, and predicted with linear
+makes AR jewellery look fake. Where the wrist is on screen goes through a constant-velocity
+Kalman filter and a small deadzone (`core/ScreenPointFilter.js`): the 1€ filter it replaced
+trailed every movement by 5-10 px at webcam frame rates, most of all as a movement started
+(scorecard lag p95 11.2 -> 4.2 px). The forearm's direction and its sideways centre come
+from this frame's arm mask, taken as they are once the outline fit is confident, with only a
+1° deadzone on the direction: the cylinder trailed the very mask it was measured from (angle
+to it while moving, p95, 10.2° -> 2.9°; centre 17.7 -> 8.3 px). The centre has a deadzone
+too (3 mm still, 0.5 mm moving): taken raw it shook a still arm sideways. A mask cannot show
+roll about the arm: roll comes from the hand, through a 10° / 2° deadzone (`core/Deadzone.js`)
+that replaced a Kalman filter - still, it holds (twitch p50 0.66° -> 0°); turning, it trails
+by p95 5.2° instead of 22.7°; the price is that a still roll can sit up to 10° off the
+measurement. Only the distance keeps a smoothing filter (a deadzone made the size jump at
+rest). Pose is predicted with linear
 and angular velocity only across a camera frame the hand detector skipped.
 
 ### One camera frame in, one image out

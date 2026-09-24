@@ -1,9 +1,9 @@
 import * as THREE from 'three'
-import { WALL_NEAR_MM, WALL_FAR_MM } from './walls.js'
+import { BACKSTOP_NEAR_MM, BACKSTOP_FAR_MM } from './walls.js'
 import { ArmInertia } from './ArmInertia.js'
 import { JewelleryFrame } from './JewelleryFrame.js'
 import { armContact, fitSqueeze } from './armTube.js'
-import { livelinessFrom, physicsTuning } from './tuning.js'
+import { tuningFrom } from './tuning.js'
 import { BraceletCategory } from '../assets/schema.js'
 
 /** Fixed simulation step, s: the result does not depend on the display rate. */
@@ -81,7 +81,7 @@ export class RigidSolver {
     /** How far the ring is tipped off the arm's cross-section, rad. */
     this.tiltRad = 0
     this.contact = 0
-    this.walls = { nearS: WALL_NEAR_MM, farS: WALL_FAR_MM }
+    this.walls = { nearS: BACKSTOP_NEAR_MM, farS: BACKSTOP_FAR_MM }
     this.sleeping = false
 
     this.frame = new JewelleryFrame()
@@ -134,7 +134,7 @@ export class RigidSolver {
       options = neighbours ?? {}
       neighbours = []
     }
-    const tune = physicsTuning(livelinessFrom(options))
+    const tune = tuningFrom(options)
     this._shape(asset, fit)
 
     const restarted = this.frame.begin(twin)
@@ -274,8 +274,10 @@ export class RigidSolver {
     // --- Constraints ------------------------------------------------------
     const pad = asset.fit.clearanceMm * 0.3
     const rho = asset.stockRadiusMm
-    const near = WALL_NEAR_MM + rho
-    const far = WALL_FAR_MM - rho
+    // Backstops only (walls.js): the flares in the contact surface are what
+    // stop a piece at the hand and toward the elbow.
+    const near = BACKSTOP_NEAR_MM + rho
+    const far = BACKSTOP_FAR_MM - rho
     const cuff = asset.category === BraceletCategory.OPEN_CUFF
     if (cuff) {
       // A cuff springs onto the wrist: centred on the arm, turned with it (with
@@ -313,7 +315,7 @@ export class RigidSolver {
             this._staticFriction(P, _n, _from, this._lambda[i], tune.frictionStatic)
           }
         }
-        // Wall planes: the band of metal, not just the centreline.
+        // Backstop planes: the band of metal, not just the centreline.
         const y = this.x.y + _r.y
         if (y < near) this._applyPositional(_r, _n.set(0, 1, 0), near - y)
         else if (y > far) this._applyPositional(_r, _n.set(0, -1, 0), y - far)

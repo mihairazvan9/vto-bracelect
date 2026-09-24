@@ -57,6 +57,7 @@ const TARGETS = {
     <div class="toggles">
       <label v-for="(label, key) in {
         frameLock: 'Lock drawing to camera frames',
+        rawPose: 'Raw pose: no smoothing, jewellery pinned',
         lightEstimation: 'Camera light estimation',
         showOccluder: 'Show wrist occluder',
         showWristFrame: 'Show wrist frame (rotation)',

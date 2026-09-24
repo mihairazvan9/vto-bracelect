@@ -50,10 +50,13 @@ export function physicsTuning(liveliness = DEFAULT_LIVELINESS) {
     /** Largest tilt of a rigid piece off the arm's cross-section: tasteful, not floppy. */
     maxTiltRad: lerp(4, 10, L) * DEG,
     /**
-     * Pull of a piece toward its resting station along the arm, 1/s (0 = only
-     * friction and the walls hold it). Calm pieces stay where they were put.
+     * Pull of a piece toward its resting station along the arm, 1/s. None: a
+     * piece slides freely along the arm, held only by what holds a real one -
+     * skin friction, gravity, the arm's motion, and the flares at the hand and
+     * elbow (walls.js). The pull (3 /s calm, 0.4 lively) made every piece feel
+     * parked at one spot. The station is still where a piece is first seated.
      */
-    axialHold: lerp(3, 0.4, L),
+    axialHold: 0,
   }
 }
 
@@ -62,4 +65,19 @@ export function livelinessFrom(options = {}) {
   if (Number.isFinite(options.liveliness)) return options.liveliness
   if (options.realistic === true) return 1
   return DEFAULT_LIVELINESS
+}
+
+/**
+ * The solvers' parameters from their options. `pinned` (diagnostic, the
+ * engine's raw pose) keeps the piece's own dynamics - gravity, contact with
+ * the arm - but takes away everything that makes it lag the arm: its frame
+ * follows the arm's twist at once, and the arm's motion pushes it no more.
+ */
+export function tuningFrom(options = {}) {
+  const tune = physicsTuning(livelinessFrom(options))
+  if (options.pinned) {
+    tune.twistFollowHz = Infinity
+    tune.inertia = { ...tune.inertia, gain: 0, shakeGain: 0 }
+  }
+  return tune
 }

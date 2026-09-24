@@ -207,6 +207,8 @@ export class VTOEngine {
        * between frames (false).
        */
       frameLock: true,
+      /** Diagnostic: the wrist pose exactly as measured each frame, no smoothing (WristTracker.raw). */
+      rawPose: false,
     }
 
     this._running = false
@@ -404,6 +406,7 @@ export class VTOEngine {
       // Re-solve whenever either detector produced something new, not just the
       // hand: in pose-only mode the hand never updates at all.
       let observation = null
+      this.observer.raw = this.observer.forearm.raw = this.tracker.raw = !!this.options.rawPose
       if (this.perception.revision !== this._lastRevision) {
         this._lastRevision = this.perception.revision
         const source = this.sources.build(this.perception.hands, this.cameraModel)
@@ -538,7 +541,8 @@ export class VTOEngine {
     // Stacking: each piece gets its own band of forearm so they sit side by side
     // instead of intersecting, then the chains collide with their neighbours.
     let cursor = 0
-    const physics = { liveliness: this.options.physicsLiveliness }
+    // Raw pose pins the jewellery to the arm too (physics/tuning.js tuningFrom).
+    const physics = { liveliness: this.options.physicsLiveliness, pinned: !!this.options.rawPose }
     for (let i = 0; i < this.instances.length; i++) {
       const inst = this.instances[i]
       const width = Math.max(inst.asset.stockRadiusMm * 2, inst.asset.links?.widthMm ?? 0)

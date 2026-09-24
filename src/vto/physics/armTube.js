@@ -5,6 +5,8 @@
  * turned by the frame's delta (the arm's twist the frame has not followed).
  */
 
+import { BACKSTOP_FAR_MM, BACKSTOP_NEAR_MM, flareAt } from './walls.js'
+
 /** Arm-space stations the tube is modelled over (the collision surface). */
 export const TUBE_MIN_S = -10
 export const TUBE_MAX_S = 120
@@ -17,6 +19,7 @@ export const TUBE_MAX_S = 120
 const TUNNEL_F = 0.36
 
 const _section = { a: 0, b: 0 }
+const _flare = { a: 0, b: 0 }
 const _ahead = { a: 0, b: 0 }
 const _behind = { a: 0, b: 0 }
 /** Half the span over which the arm's taper is read, mm. */
@@ -46,9 +49,10 @@ export function armContact(p, twin, delta, pad, from, out, taper = false, squeez
   // Into the arm's own axes: u radial, v dorsal.
   let u = p.x * c - p.z * s
   let v = p.x * s + p.z * c
-  twin.sectionAt(Math.min(TUBE_MAX_S, Math.max(TUBE_MIN_S, p.y)), _section)
-  const A = _section.a * squeeze + pad
-  const B = _section.b * squeeze + pad
+  const y = Math.min(BACKSTOP_FAR_MM, Math.max(BACKSTOP_NEAR_MM, p.y))
+  contactSection(twin, y, squeeze, _section)
+  const A = _section.a + pad
+  const B = _section.b + pad
   const f = (u * u) / (A * A) + (v * v) / (B * B)
   if (f >= 1) return false
   let g = f
@@ -78,12 +82,12 @@ export function armContact(p, twin, delta, pad, from, out, taper = false, squeez
   if (taper) {
     // dF/ds = -2 (u^2 A'/A^3 + v^2 B'/B^3): where the arm widens toward the
     // elbow, the surface faces a little back toward the hand. That slope is
-    // what wedges a tight ring and stops a loose one sliding up the arm.
-    const y = Math.min(TUBE_MAX_S, Math.max(TUBE_MIN_S, p.y))
-    twin.sectionAt(y + TAPER_DS, _ahead)
-    twin.sectionAt(y - TAPER_DS, _behind)
-    const dA = ((_ahead.a - _behind.a) * squeeze) / (2 * TAPER_DS)
-    const dB = ((_ahead.b - _behind.b) * squeeze) / (2 * TAPER_DS)
+    // what wedges a tight ring and stops a loose one sliding up the arm - and,
+    // on the hand flare (walls.js), what a piece that slid down rests on.
+    contactSection(twin, y + TAPER_DS, squeeze, _ahead)
+    contactSection(twin, y - TAPER_DS, squeeze, _behind)
+    const dA = (_ahead.a - _behind.a) / (2 * TAPER_DS)
+    const dB = (_ahead.b - _behind.b) / (2 * TAPER_DS)
     ns = -((su * su * dA) / (A * A * A) + (sv * sv * dB) / (B * B * B))
   }
   const nl = Math.hypot(nu, nv, ns) || 1
@@ -121,7 +125,21 @@ export function fitSqueeze(twin, s, innerA, innerB, pad) {
   return Math.min(1, Math.max(0.5, k))
 }
 
-/** The arm's section at station s: { a, b } semi-axes (mm), unrotated. */
+/**
+ * The surface pieces touch at station s: the arm's section, squeezed where a
+ * piece is too tight (fitSqueeze), plus the flares past the wrist and toward
+ * the elbow (walls.js). The flares are never squeezed: a tight piece gives
+ * the skin of the wrist, it does not get to pass the hand.
+ */
+export function contactSection(twin, s, squeeze, out) {
+  armSection(twin, s, out)
+  flareAt(s, out.a, twin.handBreadthMm, _flare)
+  out.a = out.a * squeeze + _flare.a
+  out.b = out.b * squeeze + _flare.b
+  return out
+}
+
+/** The arm's section at station s: { a, b } semi-axes (mm), unrotated, without the flares. */
 export function armSection(twin, s, out = { a: 0, b: 0 }) {
   return twin.sectionAt(Math.min(TUBE_MAX_S, Math.max(TUBE_MIN_S, s)), out)
 }

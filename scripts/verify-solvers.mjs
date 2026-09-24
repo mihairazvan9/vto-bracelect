@@ -18,7 +18,7 @@ import { WristDigitalTwin } from '../src/vto/wrist/WristDigitalTwin.js'
 import { WristTracker } from '../src/vto/wrist/WristTracker.js'
 import { FitSolver, FitVerdict } from '../src/vto/fit/FitSolver.js'
 import { RigidSolver } from '../src/vto/physics/RigidSolver.js'
-import { WALL_NEAR_MM, WALL_FAR_MM } from '../src/vto/physics/walls.js'
+import { BACKSTOP_NEAR_MM, BACKSTOP_FAR_MM, HAND_FLARE_FROM_MM } from '../src/vto/physics/walls.js'
 import { physicsTuning } from '../src/vto/physics/tuning.js'
 import { GeometrySolver } from '../src/vto/wrist/GeometrySolver.js'
 import { XPBDChainSolver } from '../src/vto/physics/XPBDChainSolver.js'
@@ -348,9 +348,16 @@ const solver = new FitSolver()
   const uprightSolver = new RigidSolver()
   for (let i = 0; i < 90; i++) uprightSolver.solve(bangle, uprightFit, upright, 1 / 60, { realistic: true })
   const uprightTilt = THREE.MathUtils.radToDeg(Math.abs(uprightSolver.tiltRad))
-  // It lands on the widening arm and may jam a few degrees off level, as a
-  // ring dropped on a cone does - not the 8 deg tip to an arbitrary side.
-  check('a loose ring on a vertical arm hangs level', uprightTilt < 4, `${uprightTilt.toFixed(2)} deg`)
+  // It lands on the widening arm and comes to rest there. Here that is the
+  // forearm-end flare (walls.js), an oval cone: a round ring touches it at the
+  // ends of its wide axis and rocks about that axis until it rests - a tilt the
+  // geometry sets, not the tip to an arbitrary side that was the bug. At rest,
+  // within the tilt cap.
+  check(
+    'a loose ring on a vertical arm comes to rest on the cone, within the tilt cap',
+    uprightSolver.sleeping && uprightTilt <= THREE.MathUtils.radToDeg(physicsTuning(1).maxTiltRad) + 0.01,
+    `${uprightTilt.toFixed(2)} deg, ${uprightSolver.sleeping ? 'at rest' : 'still moving'}`,
+  )
   const sloped = makeTwin(52, 38, new THREE.Vector3(0.7, -0.7, 0.1))
   const slopedFit = solver.evaluate(bangle, sloped)
   const slopedSolver = new RigidSolver()
@@ -961,14 +968,16 @@ for (const id of ['tennis-brilliant', 'chain-rope-14k', 'charm-heirloom']) {
 
 // ------------------------------------------------------- invisible walls
 {
-  // Two planes across the arm at the ends of the tube. Between them the
-  // bracelet moves freely; it never passes either one. Nothing about them is
-  // drawn or occludes.
+  // The physics arm flares past the wrist (onto the hand) and toward the
+  // elbow; far-out backstop planes only catch what the flares miss. A piece
+  // moves freely along the arm, is stopped BY THE FLARES (never reaching a
+  // backstop), and comes to rest on the hand flare, not on a plane. Nothing
+  // about them is drawn or occludes.
   const bangle = getBracelet('bangle-classic-18k')
   const alongOf = (twin, p) => p.clone().sub(twin.creasePoint).dot(twin.forearmAxis)
 
   // Hand raised, forearm straight down: gravity slides a loose bangle up the
-  // arm, and it must stop at the far plane.
+  // arm, and the elbow flare must stop it before the backstop.
   for (const realistic of [true, false]) {
     const down = makeTwin(44, 32, new THREE.Vector3(0.05, -1, 0.02))
     const fit = solver.evaluate(bangle, down)
@@ -983,8 +992,28 @@ for (const id of ['tennis-brilliant', 'chain-rope-14k', 'charm-heirloom']) {
       hi = Math.max(hi, at)
     }
     const mode = realistic ? 'realistic' : 'stable'
-    check(`${mode}: a sliding bangle stays between the wall planes`, lo >= WALL_NEAR_MM - 0.01 && hi <= WALL_FAR_MM + 0.01, `${lo.toFixed(1)}..${hi.toFixed(1)} mm, planes at ${WALL_NEAR_MM}/${WALL_FAR_MM}`)
+    check(`${mode}: a sliding bangle is stopped by the flares, not the backstops`, lo > BACKSTOP_NEAR_MM + 1 && hi < BACKSTOP_FAR_MM - 1, `${lo.toFixed(1)}..${hi.toFixed(1)} mm, backstops at ${BACKSTOP_NEAR_MM}/${BACKSTOP_FAR_MM}`)
     check(`${mode}: ...and is free to move between them`, hi - fit.restingOffsetMm > 3, `slid ${(hi - fit.restingOffsetMm).toFixed(1)} mm from rest`)
+  }
+
+  // Hand down, forearm straight up: the bangle slides toward the hand and must
+  // come to rest ON THE HAND FLARE - past where the flare starts, short of the
+  // backstop - tilted by it rather than standing square against a plane.
+  // Realistic only: calm pieces are held at their station (axialHold) and do
+  // not slide down at all.
+  for (const realistic of [true]) {
+    const up = makeTwin(44, 32, new THREE.Vector3(0.05, 1, 0.02))
+    const fit = solver.evaluate(bangle, up)
+    const rigid = new RigidSolver()
+    let at = 0
+    let lo = Infinity
+    for (let i = 0; i < 400; i++) {
+      rigid.solve(bangle, fit, up, 1 / 60, { realistic })
+      at = alongOf(up, rigid.position)
+      lo = Math.min(lo, at)
+    }
+    const mode = realistic ? 'realistic' : 'stable'
+    check(`${mode}: a bangle sliding to the hand rests on the hand flare`, at < HAND_FLARE_FROM_MM && lo > BACKSTOP_NEAR_MM + 1, `rests at ${at.toFixed(1)} mm (flare from ${HAND_FLARE_FROM_MM}), lowest ${lo.toFixed(1)}, backstop ${BACKSTOP_NEAR_MM}`)
   }
 
   // Stable mode keeps sag and tilt small even with a lot of slack.
@@ -1017,7 +1046,7 @@ for (const id of ['tennis-brilliant', 'chain-rope-14k', 'charm-heirloom']) {
         hi = Math.max(hi, along)
       }
     }
-    check(`${id}: every link stays between the wall planes while shaken`, lo >= WALL_NEAR_MM - 0.5 && hi <= WALL_FAR_MM + 0.5, `${lo.toFixed(1)}..${hi.toFixed(1)} mm`)
+    check(`${id}: every link is held by the flares while shaken, clear of the backstops`, lo > BACKSTOP_NEAR_MM + 0.5 && hi < BACKSTOP_FAR_MM - 0.5, `${lo.toFixed(1)}..${hi.toFixed(1)} mm`)
   }
 }
 
@@ -1107,7 +1136,7 @@ for (const id of ['tennis-brilliant', 'chain-rope-14k', 'charm-heirloom']) {
       }
       const mode = realistic ? 'realistic' : 'stable'
       check(`${mode} ${id}: violent pose jitter never unthreads the loop`, off === 0 && chain.recoveries === 0, `${off} frames off the arm, ${chain.recoveries} re-seats`)
-      check(`${mode} ${id}: ...every link stays between the walls`, lo >= WALL_NEAR_MM - 0.01 && hi <= WALL_FAR_MM + 0.01, `${lo.toFixed(1)}..${hi.toFixed(1)} mm`)
+      check(`${mode} ${id}: ...every link is held by the flares, clear of the backstops`, lo > BACKSTOP_NEAR_MM + 0.5 && hi < BACKSTOP_FAR_MM - 0.5, `${lo.toFixed(1)}..${hi.toFixed(1)} mm`)
       check(`${mode} ${id}: ...and out of the arm`, deepest < 0.06, `worst penetration factor ${deepest.toFixed(3)}`)
       check(`${mode} ${id}: world output is exactly the arm-space state`, publishErr < 1e-3, `${publishErr.toExponential(1)} mm`)
     }
@@ -1146,35 +1175,46 @@ for (const id of ['tennis-brilliant', 'chain-rope-14k', 'charm-heirloom']) {
     check('calm: a held arm under tracking noise leaves the chain still on the arm', mean < 0.05, `${mean.toFixed(3)} mm/frame on the arm`)
   }
 
-  // Real motion must still reach the chain: a brisk sideways swing makes a
-  // loose chain move on the arm, and it settles again once the arm stops.
+  // Real motion must still reach the chain: a brisk swing makes a loose chain
+  // move on the arm, and it comes to rest again once the arm stops - wherever
+  // the swing left it (nothing pulls it back to a station any more). A nearly
+  // level forearm, the chain lying over it: straight up or down, a free chain
+  // slides to the flare at that end and wedges there, as a real one does.
   {
     const asset = getBracelet('charm-heirloom')
-    const twin = makeTwin(44, 32, new THREE.Vector3(0.05, -1, 0.02))
+    const twin = makeTwin(44, 32, new THREE.Vector3(1, -0.05, 0.02))
     const fit = solver.evaluate(asset, twin)
     const chain = new XPBDChainSolver()
-    const still = new THREE.Quaternion()
+    // Move the arm without re-aiming it (the shared helper would turn it back upright).
+    const home = twin.center.clone()
+    const shift = (o) => {
+      twin.center.copy(home).add(o)
+      twin.creasePoint.copy(twin.center)
+      twin.crossSections.forEach((sec) => sec.center.copy(twin.creasePoint).addScaledVector(twin.forearmAxis, sec.s))
+    }
     const centroid = () => chain.local.reduce((c, p) => c.add(p), new THREE.Vector3()).multiplyScalar(1 / chain.local.length)
     for (let i = 0; i < 120; i++) {
-      place(twin, new THREE.Vector3(), still)
+      shift(new THREE.Vector3())
       chain.solve(asset, fit, twin, 1 / 60, [], { realistic: true })
     }
     const rest = centroid()
     let swing = 0
     for (let i = 0; i < 120; i++) {
-      place(twin, new THREE.Vector3(Math.sin((i / 60) * 2 * Math.PI * 2) * 40, 0, 0), still)
+      // Along the arm: ~0.6 g peak, more than skin friction holds.
+      shift(new THREE.Vector3(Math.sin((i / 60) * 2 * Math.PI * 2) * 40, 0, 0))
       chain.solve(asset, fit, twin, 1 / 60, [], { realistic: true })
       swing = Math.max(swing, centroid().distanceTo(rest))
     }
     check('realistic: a real swing of the arm moves the chain on it', swing > 1.5, `${swing.toFixed(1)} mm from rest`)
     let settle = 0
+    let settledAt = null
     for (let i = 0; i < 240; i++) {
-      place(twin, new THREE.Vector3(), still)
+      shift(new THREE.Vector3())
       chain.solve(asset, fit, twin, 1 / 60, [], { realistic: true })
-      if (i >= 180) settle = Math.max(settle, centroid().distanceTo(rest))
+      if (i === 180) settledAt = centroid()
+      if (i > 180) settle = Math.max(settle, centroid().distanceTo(settledAt))
     }
-    // A chain comes to rest near where it was, not exactly on it.
-    check('...and settles back once the arm stops', settle < 1, `${settle.toFixed(2)} mm from rest`)
+    check('...and comes to rest once the arm stops', settle < 0.3, `moved ${settle.toFixed(2)} mm in its last second`)
   }
 
   // The occluder tube is built once; after that the pose only moves it.

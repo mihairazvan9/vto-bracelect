@@ -74,7 +74,7 @@ try {
   await page.goto('http://localhost:5198/', { waitUntil: 'networkidle2' })
   await page.click('button.primary')
   await page.waitForFunction(() => window.__vto, { timeout: 60000 })
-  await page.evaluate((occ, walls) => { window.__vto.options.showSegmentation = true; window.__vto.options.showWristFrame = true; window.__vto.options.showOccluder = occ; window.__vto.options.showWalls = walls }, !process.env.NO_OCC, !!process.env.WALLS)
+  await page.evaluate((occ, walls, raw) => { window.__vto.options.showSegmentation = true; window.__vto.options.showWristFrame = true; window.__vto.options.showOccluder = occ; window.__vto.options.showWalls = walls; window.__vto.options.rawPose = raw }, !process.env.NO_OCC, !!process.env.WALLS, !!process.env.RAW)
   const samples = []
   for (let s = 0; s < seconds; s++) {
     await new Promise((r) => setTimeout(r, 1000))

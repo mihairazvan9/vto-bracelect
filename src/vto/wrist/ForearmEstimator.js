@@ -26,6 +26,9 @@ const RELAX_TAU_S = 4
 /** A gap this long means the estimate is stale: re-seed rather than carry it. */
 const RESET_GAP_MS = 400
 
+/** Silhouette confidence from which the arm's image line is taken as it is (see update). */
+const SILHOUETTE_FULL_CONFIDENCE = 0.5
+
 /** Smoothing of the motion cue itself, so one noisy frame cannot flip it. */
 const MOTION_LP_S = 0.08
 
@@ -119,6 +122,8 @@ export class ForearmEstimator {
     /** 0 = hand rotation read as wrist bend, 1 = read as the whole arm moving. */
     this.carry = 0
     this.fromSilhouette = false
+    /** Diagnostic: no carry-over between frames (see update). */
+    this.raw = false
 
     this._lastTime = 0
     this._lastCrease = new THREE.Vector3()
@@ -153,6 +158,17 @@ export class ForearmEstimator {
     const d = this.direction
     const dt = (t - this._lastTime) / 1000
     this.fromSilhouette = false
+
+    // Diagnostic (the engine's raw pose): no memory across frames - this
+    // frame's mask line where there is one, else the hand's own axis.
+    if (this.raw) {
+      d.copy(hand.axis)
+      if (silhouette) this.fromSilhouette = this._applySilhouette(silhouette, 1)
+      this.carry = 0
+      this._remember(hand, crease, t)
+      this.valid = true
+      return d
+    }
 
     if (!this.valid || !(dt > 0) || dt * 1000 > RESET_GAP_MS) {
       d.copy(hand.axis)
@@ -212,7 +228,10 @@ export class ForearmEstimator {
     rotateToward(d, hand.axis, 1 - Math.exp(-dt / RELAX_TAU_S))
 
     // --- Correct: the silhouette owns the in-image direction ---------------
-    if (silhouette) this.fromSilhouette = this._applySilhouette(silhouette, silhouette.confidence)
+    // Fully, once its fit is confident: taken only `confidence` of the way
+    // (0.3-0.6 typically), the rest was carried from earlier frames - a
+    // smoothing filter in disguise, and the cylinder trailed the mask.
+    if (silhouette) this.fromSilhouette = this._applySilhouette(silhouette, silhouette.confidence / SILHOUETTE_FULL_CONFIDENCE)
 
     // --- Range of motion ---------------------------------------------------
     const joint = d.angleTo(hand.axis)

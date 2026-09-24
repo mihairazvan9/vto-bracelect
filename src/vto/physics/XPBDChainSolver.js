@@ -1,9 +1,9 @@
 import * as THREE from 'three'
-import { WALL_NEAR_MM, WALL_FAR_MM } from './walls.js'
+import { BACKSTOP_NEAR_MM, BACKSTOP_FAR_MM } from './walls.js'
 import { ArmInertia } from './ArmInertia.js'
 import { JewelleryFrame } from './JewelleryFrame.js'
 import { armContact, armSection } from './armTube.js'
-import { livelinessFrom, physicsTuning } from './tuning.js'
+import { tuningFrom } from './tuning.js'
 import { BraceletCategory } from '../assets/schema.js'
 
 /**
@@ -34,7 +34,21 @@ const _toSim = new THREE.Quaternion()
 const _g = new THREE.Vector3()
 const _w = new THREE.Vector3()
 const _alpha = new THREE.Vector3()
-const _contact = { x: 0, z: 0, nx: 0, nz: 0, depth: 0 }
+const _contact = { x: 0, z: 0, nx: 0, ny: 0, nz: 0, depth: 0 }
+
+/**
+ * Move `p` out of the arm along the contact normal, by the depth measured
+ * along it (armContact's surface point is straight out from the axis; on a
+ * slope the normal reaches the surface sooner). Returns that depth.
+ */
+function pushAlongNormal(p, contact) {
+  const c = (contact.x - p.x) * contact.nx + (contact.z - p.z) * contact.nz
+  if (!(c > 0)) return 0
+  p.x += contact.nx * c
+  p.y += contact.ny * c
+  p.z += contact.nz * c
+  return c
+}
 const _section = { a: 0, b: 0 }
 
 /**
@@ -77,7 +91,7 @@ export class XPBDChainSolver {
      * A safety net that should never fire; counted so it is visible if it does.
      */
     this.recoveries = 0
-    this.walls = { nearS: WALL_NEAR_MM, farS: WALL_FAR_MM }
+    this.walls = { nearS: BACKSTOP_NEAR_MM, farS: BACKSTOP_FAR_MM }
 
     /** Link positions in the simulation's own frame (JewelleryFrame): the physical state. */
     this.sim = []
@@ -110,7 +124,7 @@ export class XPBDChainSolver {
    * @param {{liveliness?: number, realistic?: boolean}} [options]
    */
   solve(asset, fit, twin, dt, neighbours = [], options = {}) {
-    const tune = physicsTuning(livelinessFrom(options))
+    const tune = tuningFrom(options)
     const restarted = this.jframe.begin(twin)
     const target = fit.restingOffsetMm
     if (this._rest === null || restarted) this._rest = target
@@ -407,21 +421,16 @@ export class XPBDChainSolver {
   }
 
   /**
-   * Along the arm: a soft pull toward the resting station (how much depends on
-   * liveliness), and a band round it the loop does not leave - real chains
-   * drift along the arm, they do not wander off the wrist.
+   * Along the arm: the pull toward the resting station, if the tuning has one
+   * (tuning.js axialHold - none by default). There is no band round the
+   * station any more: a loop slides freely until friction holds it or a flare
+   * stops it (walls.js); the band pinned every chain within ~8 mm of one spot.
    */
   _solveAxial(asset, tune, h) {
+    if (!(tune.axialHold > 0)) return
     const rest = this._rest
     const hold = 1 - Math.exp(-tune.axialHold * h)
-    const allowed = 5 + asset.links.widthMm
-    const bandPull = 1 - Math.exp(-(8 + 12 * asset.fit.stiffness) * h)
-    for (const p of this.sim) {
-      const along = p.y - rest
-      p.y -= along * hold
-      const excess = Math.abs(along) - allowed
-      if (excess > 0) p.y -= Math.sign(along) * excess * bandPull
-    }
+    for (const p of this.sim) p.y -= (p.y - rest) * hold
   }
 
   /** Keep stacked bracelets from occupying the same stretch of arm. */
@@ -433,30 +442,33 @@ export class XPBDChainSolver {
     }
   }
 
-  /** Push links (and charms) out of the arm; how hard is the friction budget. */
+  /**
+   * Push links (and charms) out of the arm; how hard is the friction budget.
+   * Along the surface's true normal: on the arm's cylinder that is straight
+   * out, on the hand flare (walls.js) it is out AND back up the arm - the
+   * slope a loop that slid down comes to rest on.
+   */
   _solveArm(asset, twin) {
     const pad = asset.stockRadiusMm + asset.fit.clearanceMm * 0.3
     for (let i = 0; i < this.sim.length; i++) {
       const p = this.sim[i]
-      if (!armContact(p, twin, 0, pad, this._prev[i], _contact, false, this._squeeze)) continue
-      this._contactDepth[i] += _contact.depth
-      this.maxContact = Math.max(this.maxContact, Math.min(1, _contact.depth / pad))
-      p.x = _contact.x
-      p.z = _contact.z
+      if (!armContact(p, twin, 0, pad, this._prev[i], _contact, true, this._squeeze)) continue
+      const c = pushAlongNormal(p, _contact)
+      this._contactDepth[i] += c
+      this.maxContact = Math.max(this.maxContact, Math.min(1, c / pad))
     }
     for (const charm of this.charms) {
-      if (armContact(charm.x, twin, 0, charm.spec.sizeMm * 0.4, charm.prev, _contact, false, this._squeeze)) {
-        charm.x.x = _contact.x
-        charm.x.z = _contact.z
+      if (armContact(charm.x, twin, 0, charm.spec.sizeMm * 0.4, charm.prev, _contact, true, this._squeeze)) {
+        pushAlongNormal(charm.x, _contact)
       }
     }
   }
 
-  /** The wall planes (walls.js): in this frame simply y = near and y = far. */
+  /** The backstop planes (walls.js): in this frame simply y = near and y = far. The flares in the contact surface stop links first. */
   _solveWalls(asset) {
     const pad = asset.stockRadiusMm
-    const near = WALL_NEAR_MM + pad
-    const far = WALL_FAR_MM - pad
+    const near = BACKSTOP_NEAR_MM + pad
+    const far = BACKSTOP_FAR_MM - pad
     for (const p of this.sim) {
       if (p.y < near) p.y = near
       else if (p.y > far) p.y = far

@@ -101,6 +101,13 @@ export class JewelleryFrame {
    * @param {number} followHz
    */
   step(h, followHz) {
+    if (followHz === Infinity) {
+      // Pinned (tuningFrom): the frame IS the arm's.
+      this._simRoll = this._armRoll
+      this._simRate = 0
+      this._compose()
+      return
+    }
     const wn = 2 * Math.PI * followHz
     const n = Math.max(1, Math.ceil(h / FOLLOW_STEP_S - 1e-9))
     const k = h / n

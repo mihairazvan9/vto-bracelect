@@ -1,7 +1,9 @@
 import * as THREE from 'three'
 import { WristDigitalTwin } from './WristDigitalTwin.js'
 import { GeometrySolver } from './GeometrySolver.js'
-import { OneEuroFilter, OneEuroVec } from '../core/OneEuroFilter.js'
+import { OneEuroFilter } from '../core/OneEuroFilter.js'
+import { ScreenPointFilter } from '../core/ScreenPointFilter.js'
+import { Deadzone1D } from '../core/Deadzone.js'
 import { OrientationFilter } from './OrientationFilter.js'
 import {
   angularVelocity,
@@ -58,8 +60,13 @@ const REFERENCE_S_MM = 18
  * mm per frame; a bad mask row moved it 18 mm and straight back.
  */
 const CENTRE_GATE_MM = 7
-/** Fastest the centreline offset (and so the bracelet, sideways) may move, mm/s. */
-const CENTRE_SLEW_MM_S = 90
+/**
+ * Deadzone on the centreline offset, mm: still / moving band. Taken raw from
+ * each frame's mask it shook a still arm sideways; with this the shake of a
+ * point 20 mm up the arm on a still arm went 1.48 -> 0.96 px (p50), with no
+ * extra lag while moving.
+ */
+const CENTRE_DEADZONE_MM = { rest: 3, move: 0.5 }
 
 /**
  * The arm ruler's weight at which its depth is trusted enough to jump to
@@ -104,19 +111,28 @@ export class WristTracker {
     this.geometry = new GeometrySolver()
     this.tracking = new TrackingStateMachine()
 
-    // Screen direction (x/depth, y/depth): the old mm settings rescaled to
-    // these units at a typical ~400 mm wrist distance.
-    this.positionFilter = new OneEuroVec(2, { minCutoff: 1.7, beta: 14, dCutoff: 1.0 })
+    // Screen direction (x/depth, y/depth): predicted along the motion, so a
+    // moving wrist is not trailed, and held while still (see ScreenPointFilter:
+    // the 1€ filter here trailed every movement by 5-10 px).
+    this.positionFilter = new ScreenPointFilter()
     // log(depth): ~0.5 Hz when steady; moving toward the camera at 200 mm/s
     // (0.5 /s in log units) lifts it to ~1.5 Hz.
     this.depthFilter = new OneEuroFilter({ minCutoff: 0.5, beta: 2, dCutoff: 1.0 })
     // Direction and roll filtered apart (see OrientationFilter): the axis by a
-    // 1€ filter as before, the roll - the noisiest part of the pose - by a
+    // 1 deg deadzone, the roll - the noisiest part of the pose - by a
     // Kalman filter.
     this.rotationFilter = new OrientationFilter()
+    /**
+     * Diagnostic: take each observation as it is - no smoothing, gating or
+     * slew limit on position, distance, orientation or the arm's centreline.
+     * The filters keep running, so switching back does not start them cold.
+     */
+    this.raw = false
     /** Drops the detector's mirror flips of the palm (see PoseGates). */
     this.twistGate = new TwistGate()
     this.centreGate = new SpikeGate(CENTRE_GATE_MM)
+    /** Holds the centreline still on a still arm (see CENTRE_DEADZONE_MM). */
+    this.centreDeadzone = new Deadzone1D(CENTRE_DEADZONE_MM)
     this.rulerGate = new SpikeGate(RULER_GATE)
     /** A sleeve is believed only once it persists (see SleeveFilter). */
     this.sleeveFilter = new SleeveFilter()
@@ -141,9 +157,6 @@ export class WristTracker {
     this.basis = { x: new THREE.Vector3(1, 0, 0), y: new THREE.Vector3(0, -1, 0), z: new THREE.Vector3(0, 0, 1) }
     /** Arm centreline, sideways from the wrist landmark, mm (see ingest). */
     this.centreOffset = 0
-    this._hasCentre = false
-    /** Offset speed in mm/s: still -> ~1 Hz smoothing, a 90 mm/s jump -> ~5.5 Hz. Chosen by sweep (tools/eval placement). */
-    this.centreFilter = new OneEuroFilter({ minCutoff: 1.0, beta: 0.05, dCutoff: 1.0 })
     this.sleeveLimitMm = Infinity
 
     this.lastObservationTime = 0
@@ -170,10 +183,9 @@ export class WristTracker {
     this.depthFilter.reset()
     this.rotationFilter.reset()
     this.centreOffset = 0
-    this._hasCentre = false
-    this.centreFilter.reset()
     this.twistGate.reset()
     this.centreGate.reset()
+    this.centreDeadzone.reset()
     this.rulerGate.reset()
     this.sleeveFilter.reset()
     this._depthSettled = false
@@ -208,6 +220,7 @@ export class WristTracker {
       this.rotationFilter.reset()
       this.twistGate.reset()
       this.centreGate.reset()
+      this.centreDeadzone.reset()
       this.rulerGate.reset()
       this._depthSettled = false
       this._warm = false
@@ -221,8 +234,8 @@ export class WristTracker {
     }
     this._warmUp(observation, t)
     _prev.copy(this.quaternion)
-    const observed = this.twistGate.filter(observation.quaternion, t)
-    this.quaternion.copy(this.rotationFilter.filter(observed, t, observation.poseConfidence))
+    const smoothed = this.rotationFilter.filter(this.twistGate.filter(observation.quaternion, t), t, observation.poseConfidence)
+    this.quaternion.copy(this.raw ? observation.quaternion : smoothed)
     if (this.hasPose && dt > 0 && dt <= 0.4) {
       angularVelocity(_prev, this.quaternion, dt, this.omega)
       if (this.omega.length() > 25) this.omega.setLength(25)
@@ -246,7 +259,8 @@ export class WristTracker {
     this.depthMeasurementMm = depth
     this._tmpPos[0] = p.x / depth
     this._tmpPos[1] = p.y / depth
-    const onScreen = this.positionFilter.filter(this._tmpPos, t)
+    const smoothScreen = this.positionFilter.filter(this._tmpPos, t, this.camera.focalPx)
+    const onScreen = this.raw ? this._tmpPos : smoothScreen
     // A new track starts on the palm's depth, which can be badly off (3x on
     // the side-on recording); the arm ruler corrects it, but through a
     // 0.5 Hz filter that took a quarter of a second, and the arm and every
@@ -257,7 +271,8 @@ export class WristTracker {
       this.depthFilter.reset()
       this._snapDepth = false
     }
-    const d = Math.exp(this.depthFilter.filter(Math.log(depth), t))
+    const smoothDepth = Math.exp(this.depthFilter.filter(Math.log(depth), t))
+    const d = this.raw ? depth : smoothDepth
     _v.set(onScreen[0] * d, onScreen[1] * d, -d)
 
     if (this.hasPose && dt > 0) {
@@ -290,9 +305,11 @@ export class WristTracker {
     // straight tube, so its centre is a single line; per-ring offsets let the
     // tube bend and wiggle frame to frame, and the bracelet rode the wiggle.
     // With the palm side-on MediaPipe puts the landmark on the arm's EDGE, so
-    // this is ~half the arm's width - it keeps the bracelet on the arm. It
-    // belongs to the pose, so it is smoothed (adaptively, below) and held when
-    // a frame has no measurement.
+    // this is ~half the arm's width - it keeps the bracelet on the arm. It is
+    // taken from this frame's mask as it is (a spike that the next frame does
+    // not confirm is held back), and held when a frame has no measurement. A
+    // 1€ filter and a 90 mm/s glide used to follow it: sideways off the mask's
+    // centreline while the arm moved, p95, 17.7 px with them, 8.3 without.
     {
       const measured = []
       // Read where the bracelet sits: if the tracked axis leans a little off
@@ -304,23 +321,10 @@ export class WristTracker {
       if (!measured.length) for (const entry of observation.profile) if (entry.measured) measured.push(entry.offsetMm)
       if (measured.length) {
         measured.sort((x, y) => x - y)
-        const target = this.centreGate.filter(measured[measured.length >> 1])
-        if (target !== null) {
-          // 1€: frame-to-frame noise is smoothed hard, a real change (the
-          // hand turning side-on) is followed within a frame or two.
-          if (!this._hasCentre || dt > 0.4) this.centreFilter.reset()
-          const filtered = this.centreFilter.filter(target, t)
-          // ...and then glided to, never jumped: the bracelet moving sideways
-          // across the arm at a hand's pace reads as the arm turning, a jump
-          // reads as a glitch. While the jewellery is hidden it just snaps.
-          if (this.tracking.presence < 0.05) {
-            this.centreOffset = filtered
-          } else {
-            const step = CENTRE_SLEW_MM_S * (dt > 0 ? Math.min(dt, 0.1) : 1 / 30)
-            this.centreOffset += clamp(filtered - this.centreOffset, -step, step)
-          }
-          this._hasCentre = true
-        }
+        const middle = measured[measured.length >> 1]
+        const target = this.centreGate.filter(middle)
+        if (target !== null) this.centreOffset = this.centreDeadzone.filter(target)
+        if (this.raw) this.centreOffset = middle
       }
     }
     this.sleeveLimitMm = this.sleeveFilter.filter(observation.sleeveLimitMm, t)
@@ -484,7 +488,7 @@ export class WristTracker {
     // A reading far from the last one waits for the next outline to agree;
     // meanwhile the correction already established stands, as between outlines.
     const reading = Math.log(depthArm / depthPalm)
-    if (this.rulerGate.filter(reading) !== reading) {
+    if (!this.raw && this.rulerGate.filter(reading) !== reading) {
       if (!this._rulerLog) return p
       return this._rulerPoint.copy(p).multiplyScalar(Math.exp(this._rulerLog))
     }
@@ -499,7 +503,7 @@ export class WristTracker {
       this._depthSettled = true
       this._snapDepth = true
     }
-    this._rulerLog = this._rulerLog ? this._rulerLog + (correction - this._rulerLog) * 0.6 : correction
+    this._rulerLog = this._rulerLog && !this.raw ? this._rulerLog + (correction - this._rulerLog) * 0.6 : correction
     return this._rulerPoint.copy(p).multiplyScalar(Math.exp(correction))
   }
 
@@ -529,9 +533,8 @@ export class WristTracker {
     this.rotationFilter.reset()
     this.twistGate.reset()
     this.centreGate.reset()
+    this.centreDeadzone.reset()
     this.rulerGate.reset()
-    this.centreFilter.reset()
-    this._hasCentre = false
     this.hasPose = false // no velocity or spin across the restart
   }
 

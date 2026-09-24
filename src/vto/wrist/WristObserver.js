@@ -209,6 +209,8 @@ export class WristObserver {
     this._creasePx = { x: 0, y: 0 }
     this._palmSamples = []
     this._palmFilter = new OneEuroFilter({ minCutoff: 1.2, beta: 0.004, dCutoff: 1.0 })
+    /** Diagnostic: use each frame's palm size unsmoothed (see WristTracker.raw). */
+    this.raw = false
     this._forearmPx = { x: 0, y: 0 }
     this._fittedPx = { x: 0, y: 0 }
     /** 2D wrist landmark minus rigid-fit wrist, low-passed. Pixels. */
@@ -729,7 +731,8 @@ export class WristObserver {
     // Depth follows this, so it gets a 1€ filter: still -> heavily smoothed
     // (landmark wobble made the bracelet breathe), moving -> nearly raw (the
     // joint model needs real motion toward the camera promptly).
-    this._palmNowPx = this._palmFilter.filter(sample, this._palmTime ?? 0)
+    const smoothPalm = this._palmFilter.filter(sample, this._palmTime ?? 0)
+    this._palmNowPx = this.raw ? sample : smoothPalm
     this._palmSamples.push(sample)
     if (this._palmSamples.length > PALM_WINDOW) this._palmSamples.shift()
     const sorted = Float64Array.from(this._palmSamples).sort()

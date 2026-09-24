@@ -1,48 +1,45 @@
 import * as THREE from 'three'
-import { WALL_NEAR_MM, WALL_FAR_MM } from '../physics/walls.js'
+import { ELBOW_FLARE_FROM_MM, HAND_FLARE_FROM_MM } from '../physics/walls.js'
+import { contactSection } from '../physics/armTube.js'
 
 const _c = new THREE.Vector3()
 const _section = { a: 0, b: 0 }
 const _m = new THREE.Matrix4()
-const PLANE_SCALE = 2.2 // plane radius relative to the arm's larger semi-axis
+const _q = new THREE.Quaternion()
 
 /**
- * Debug view of the invisible walls: two planes across the arm at the ends of
- * the tube (physics/walls.js). The bracelet moves freely between them and can
- * never pass either one. Drawn from the positions the solvers report they
- * enforced, so what you see is what the physics used.
+ * Where the flares are drawn, mm: the hand flare from where it starts down
+ * onto the hand; the forearm-end flare from where it starts, toward the elbow.
+ */
+const HAND_STATIONS = [0, -3, -6, -9, -12, -16].map((d) => HAND_FLARE_FROM_MM + d)
+const FAR_OFFSETS = [0, 10, 20, 30]
+const COUNT = HAND_STATIONS.length + FAR_OFFSETS.length
+
+/**
+ * Debug view of the invisible walls (physics/walls.js): the physics arm's
+ * surface where it flares - past the wrist onto the hand, and toward the
+ * elbow - as rings of the exact section the contact solve uses. A bracelet
+ * that slides down rests on the hand rings; nothing here is rendered for real
+ * or occludes anything.
  *
- * Translucent discs with an outline, drawn over everything with no depth:
- * they neither occlude nor are occluded, exactly like the walls themselves.
+ * Outlines over everything with no depth: they neither occlude nor are
+ * occluded, exactly like the walls themselves.
  */
 export class WallsDebug {
   constructor() {
     this.group = new THREE.Group()
     this.group.renderOrder = 120
-    this.planes = [0, 1].map(() => {
-      const disc = new THREE.Mesh(
-        new THREE.CircleGeometry(1, 48),
-        new THREE.MeshBasicMaterial({
-          color: 0xff4d4d,
-          transparent: true,
-          opacity: 0.22,
-          side: THREE.DoubleSide,
-          depthTest: false,
-          depthWrite: false,
-        }),
-      )
-      const rim = new THREE.LineLoop(
-        new THREE.EdgesGeometry(new THREE.CircleGeometry(1, 48)),
-        new THREE.LineBasicMaterial({ color: 0xff4d4d, transparent: true, opacity: 0.95, depthTest: false, depthWrite: false }),
-      )
-      const plane = new THREE.Group()
-      plane.add(disc, rim)
-      plane.renderOrder = 120
-      disc.renderOrder = 120
-      rim.renderOrder = 121
-      plane.visible = false
-      this.group.add(plane)
-      return plane
+    const circle = new THREE.BufferGeometry().setFromPoints(
+      Array.from({ length: 64 }, (_, i) => new THREE.Vector3(Math.cos((i / 64) * Math.PI * 2), Math.sin((i / 64) * Math.PI * 2), 0)),
+    )
+    this._geometry = circle
+    this._material = new THREE.LineBasicMaterial({ color: 0xff4d4d, transparent: true, opacity: 0.9, depthTest: false, depthWrite: false })
+    this.rings = Array.from({ length: COUNT }, () => {
+      const ring = new THREE.LineLoop(circle, this._material)
+      ring.renderOrder = 121
+      ring.visible = false
+      this.group.add(ring)
+      return ring
     })
   }
 
@@ -52,36 +49,29 @@ export class WallsDebug {
    * @param {boolean} enabled
    */
   update(twin, instances, enabled) {
-    // All pieces share the same two planes; take them from whichever solver
-    // reported (falling back to the shared constants).
-    const walls = instances.map((i) => i.rigid?.walls ?? i.chain?.walls).find(Boolean)
     const show = enabled && twin.valid
-    const stations = [walls?.nearS ?? WALL_NEAR_MM, walls?.farS ?? WALL_FAR_MM]
-    for (let i = 0; i < 2; i++) {
-      const plane = this.planes[i]
-      plane.visible = show
+    // Ring local x = dorsal, y = radial, z = forearm: right-handed in the twin
+    // frame (radial x forearm = dorsal); (radial, dorsal, forearm) would be a
+    // reflection.
+    if (show) _q.setFromRotationMatrix(_m.makeBasis(twin.dorsalAxis, twin.radialAxis, twin.forearmAxis))
+    for (let i = 0; i < COUNT; i++) {
+      const ring = this.rings[i]
+      ring.visible = show
       if (!show) continue
-      const s = stations[i]
-      twin.sectionAt(s, _section)
-      twin.pointAt(s, _c)
-      const r = Math.max(_section.a, _section.b) * PLANE_SCALE
-      // Disc local +Z = the forearm axis: the plane lies across the arm. The
-      // basis must be right-handed: the twin frame is radial x forearm =
-      // dorsal, so (dorsal, radial, forearm) is; (radial, dorsal, forearm)
-      // is a reflection and stood the discs up ALONG the arm.
-      _m.makeBasis(twin.dorsalAxis, twin.radialAxis, twin.forearmAxis)
-      plane.quaternion.setFromRotationMatrix(_m)
-      plane.position.copy(_c)
-      plane.scale.set(r, r, r)
+      const s = i < HAND_STATIONS.length ? HAND_STATIONS[i] : ELBOW_FLARE_FROM_MM + FAR_OFFSETS[i - HAND_STATIONS.length]
+      contactSection(twin, s, 1, _section)
+      // pointAt holds the centre within the twin's sections; beyond them, carry on along the axis.
+      const sections = twin.crossSections
+      const inside = Math.min(sections[sections.length - 1]?.s ?? s, Math.max(sections[0]?.s ?? s, s))
+      twin.pointAt(inside, _c).addScaledVector(twin.forearmAxis, s - inside)
+      ring.position.copy(_c)
+      ring.quaternion.copy(_q)
+      ring.scale.set(_section.b, _section.a, 1)
     }
   }
 
   dispose() {
-    for (const plane of this.planes) {
-      for (const child of plane.children) {
-        child.geometry.dispose()
-        child.material.dispose()
-      }
-    }
+    this._geometry.dispose()
+    this._material.dispose()
   }
 }

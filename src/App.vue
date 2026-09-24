@@ -43,6 +43,7 @@ const options = reactive({
   showWalls: false,
   physicsLiveliness: DEFAULT_LIVELINESS,
   frameLock: true,
+  rawPose: false,
 })
 const fits = ref([])
 

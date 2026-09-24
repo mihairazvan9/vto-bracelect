@@ -1,6 +1,5 @@
 import * as THREE from 'three'
-import { OneEuroDir } from '../core/OneEuroFilter.js'
-import { KalmanCV } from '../core/KalmanCV.js'
+import { Deadzone1D, DeadzoneDir } from '../core/Deadzone.js'
 
 const _m = new THREE.Matrix4()
 const _xObs = new THREE.Vector3()
@@ -12,27 +11,30 @@ const _c = new THREE.Vector3()
 const _swing = new THREE.Quaternion()
 
 /**
- * Forearm direction: 1€ on the axis. Same response as the old whole-frame
- * filter had for it (the axis was already steady on the recordings).
+ * Forearm direction: a 1 deg deadzone, not a smoothing filter. The direction
+ * comes from this frame's arm mask when it is confident (ForearmEstimator), and
+ * the 1€ filter that used to sit here made the cylinder trail the mask it was
+ * measured from: angle to the mask while the arm moved, p50 / p95, 1.2 / 10.2
+ * deg with it, 0.8 / 2.9 with this; on a still arm the direction's second
+ * difference stays at 0.04 / 1.2 deg. What it lets through while the arm moves
+ * is the mask following the arm.
  */
-export const DIRECTION_FILTER = { minCutoff: 1.2, beta: 0.9, dCutoff: 1.0 }
+export const DIRECTION_FILTER = { deg: 1 }
 /**
  * Roll about the forearm, rad. The detector's roll is by far the noisiest part
  * of the pose (second difference p95 ~18 deg per frame on still recordings,
- * the forearm DIRECTION ~0.7), while a real forearm turns smoothly. So roll
- * gets a constant-velocity Kalman filter.
+ * the forearm DIRECTION ~0.7). So roll gets the widest deadzone: 10 deg while
+ * the arm is still, 2 deg once it turns.
  *
- * Chosen on the recordings with the scorecard, against the old whole-frame
- * 1€ filter (roll shake p95 still-ish / moving, roll lag p50 / p90, deg):
- *   old 1€ on the quaternion     3.06 / 10.0    0.81 / 3.6
- *   q 1                          2.61 /  6.9    0.48 / 4.3
- *   q 0.5   <- this              2.32 /  6.1    0.62 / 5.2
- *   q 0.3                        2.12 /  5.6    0.76 / 6.0
- *   q 0.1                        1.70 /  4.2    1.06 / 8.7
- * Lower q is calmer and later. Manoeuvre-adaptive noise and a 1€ filter on
- * the roll angle were also tried; neither beat this trade.
+ * It replaced a constant-velocity Kalman filter (q 0.5), which was as calm on
+ * a still arm but trailed every turn of the wrist. On the recordings, per
+ * camera frame (still: second difference; turning: raw minus output averaged
+ * over +-3 frames; p50 / p95, deg):
+ *                         still          turning: lag
+ *   Kalman, q 0.5         0.38 / 1.59    2.35 / 22.7
+ *   this                  0.00 / 1.61    1.43 /  5.2
  */
-export const ROLL_FILTER = { q: 0.5, r: 0.09 * 0.09, gate: 3 }
+export const ROLL_DEADZONE_DEG = { rest: 10, move: 2 }
 
 /**
  * The tracked arm frame, filtered as two separate things: WHERE THE FOREARM
@@ -40,19 +42,20 @@ export const ROLL_FILTER = { q: 0.5, r: 0.09 * 0.09, gate: 3 }
  *
  * One filter over the whole orientation cannot treat them differently: roll
  * noise reads as rotation speed, which opens the filter up for the axis too,
- * and the axis's steadiness does nothing for the roll. Separated, the axis
- * keeps its responsive 1€ filter, and the roll - the bracelet visibly turning
- * round the arm - gets heavy, prediction-based smoothing with outliers
- * down-weighted rather than obeyed.
+ * and the axis's steadiness does nothing for the roll. Separated, each gets a
+ * deadzone of its own size - no smoothing: still, the frame holds; turning, it
+ * follows to within the band.
  *
  * Frame convention (the observer's): x radial, y forearm (wrist -> elbow),
  * z dorsal, z = x cross y.
  */
 export class OrientationFilter {
-  constructor({ direction = DIRECTION_FILTER, roll = ROLL_FILTER } = {}) {
-    this.dir = new OneEuroDir(direction)
-    this.roll = new KalmanCV(roll)
-    this.rollR = roll.r
+  constructor({ direction = DIRECTION_FILTER, roll = ROLL_DEADZONE_DEG } = {}) {
+    this.dir = new DeadzoneDir(direction)
+    const rad = Math.PI / 180
+    /** Accumulated (unwrapped) roll, rad. */
+    this.roll = new Deadzone1D({ rest: roll.rest * rad, move: roll.move * rad, calmStep: roll.rest * rad * 0.3 })
+    this._rollRate = 0
     this.radial = new THREE.Vector3(1, 0, 0)
     this.axis = new THREE.Vector3(0, -1, 0)
     this.quaternion = new THREE.Quaternion()
@@ -62,13 +65,13 @@ export class OrientationFilter {
 
   reset() {
     this.dir.reset()
-    this.roll.valid = false
+    this.roll.reset()
     this.valid = false
   }
 
-  /** Roll rate about the forearm, rad/s (positive = right-handed about +y). */
+  /** Roll rate about the forearm over the last frame, rad/s (positive = right-handed about +y). */
   get rollRate() {
-    return this.valid ? this.roll.v : 0
+    return this.valid ? this._rollRate : 0
   }
 
   /**
@@ -86,7 +89,8 @@ export class OrientationFilter {
       this.dir.reset()
       this.axis.copy(this.dir.filter(_yObs, t, trust))
       this.radial.copy(_xObs)
-      this.roll.reset(0, 0)
+      this.roll.reset(0)
+      this._rollRate = 0
       this.valid = true
       this._t = t
       return this._compose()
@@ -111,11 +115,9 @@ export class OrientationFilter {
     orthogonalise(_xAl, this.axis)
     const measured = Math.atan2(_z.crossVectors(_xRef, _xAl).dot(this.axis), _xRef.dot(_xAl))
 
-    const before = this.roll.x
-    this.roll.predict(dt)
-    const trustFactor = Math.max(0.25, Math.min(1, trust))
-    this.roll.update(before + measured, this.rollR / (trustFactor * trustFactor))
-    const turn = this.roll.x - before
+    const before = this.roll.value
+    const turn = this.roll.filter(before + measured) - before
+    this._rollRate = turn / dt
     this.radial.copy(_xRef).applyAxisAngle(this.axis, turn)
     orthogonalise(this.radial, this.axis)
     return this._compose()

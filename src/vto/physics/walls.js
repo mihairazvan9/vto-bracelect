@@ -37,12 +37,6 @@ export const ELBOW_FLARE_SLOPE = 0.3
 export const BACKSTOP_NEAR_MM = -25
 export const BACKSTOP_FAR_MM = 110
 
-/**
- * Where the arm tube itself starts, mm along the forearm (negative = onto the
- * hand). Only a short lip past the wrist: a longer stretch into the palm only
- * showed as a wrong-looking top.
- */
-export const TUBE_START_MM = -4
 
 /**
  * The flares' addition to the arm's section at station s: `out.a` to the

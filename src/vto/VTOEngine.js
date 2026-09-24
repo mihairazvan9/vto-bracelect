@@ -21,6 +21,7 @@ import { BraceletCategory } from './assets/schema.js'
 import { DEFAULT_LIVELINESS } from './physics/tuning.js'
 import { TrackingState } from './core/TrackingState.js'
 import { clamp } from './core/mathUtils.js'
+import { StageProfiler } from './core/StageProfiler.js'
 
 const MAX_RENDER_WIDTH = 1280
 /** How long a fitted arm outline is kept through frames that produced none. */
@@ -185,6 +186,12 @@ export class VTOEngine {
       frameMs: 0,
       /** Camera capture to image submitted, ms (0 = unknown on this browser). */
       latencyMs: 0,
+      /** The mode the camera agreed to, e.g. "1280×720 @ 30" (what it delivers is cameraFps). */
+      cameraMode: '',
+      /** Exposure: 'auto' | 'capped' (preferFrameRate) | 'unsupported' | '' (not known yet). */
+      cameraExposure: '',
+      /** Per-stage main-thread ms over the last ~120 images: { stage: { mean, p50, p95 } }. */
+      profile: {},
     }
 
     this.options = {
@@ -207,6 +214,12 @@ export class VTOEngine {
        * between frames (false).
        */
       frameLock: true,
+      /**
+       * Cap the camera's exposure at one frame, so dim light costs brightness
+       * instead of frame rate (CameraStream.preferFrameRate). Needs a camera
+       * that lets the browser set exposure: diagnostics.cameraExposure says.
+       */
+      preferFrameRate: false,
       /** Diagnostic: the wrist pose exactly as measured each frame, no smoothing (WristTracker.raw). */
       rawPose: false,
     }
@@ -217,6 +230,9 @@ export class VTOEngine {
     this._drawTimes = []
     this._workMs = 0
     this._latencyMs = 0
+    /** Main-thread time per stage of each drawn image (diagnostics.profile). */
+    this._prof = new StageProfiler(120)
+    this._profFrames = 0
     /** The camera frame on screen (CameraStream.takeFrame); closed when replaced. */
     this._frame = null
     this._onFrame = this._onFrame.bind(this)
@@ -244,6 +260,7 @@ export class VTOEngine {
 
   async flipCamera() {
     await this.stream.flip()
+    this._exposureWant = undefined // a new camera: apply the preference to it
     this._syncResolution()
     this._resolveLens()
     this.observer.reset()
@@ -379,6 +396,7 @@ export class VTOEngine {
 
     if (!this.stream.ready) return
     this._syncResolution()
+    this._applyExposure()
 
     // Camera-locked (the default): one image per camera frame, drawn from
     // that frame alone - its picture, its pose, physics advanced by exactly
@@ -386,9 +404,13 @@ export class VTOEngine {
     // camera frame has nothing new to show, and redrawing it (the loop used to,
     // at 120-180 Hz) only took GPU time from the hand detector.
     const fresh = this.stream.hasNewFrame()
-    const locked = this.options.frameLock
+    // On unless explicitly turned off: an options object from before the
+    // setting existed (a page kept across a hot reload) must not unlock it.
+    const locked = this.options.frameLock !== false
     if (!fresh && locked) return
     const workStart = performance.now()
+    const prof = this._prof
+    prof.begin(workStart)
 
     let dt = displayDt
     // --- Perception: every stage reads the same snapshot of this frame -------
@@ -398,10 +420,15 @@ export class VTOEngine {
       this._displayTime = frameTime
       const frame = this.stream.takeFrame()
       this._showFrame(frame)
+      prof.lap('snapshot')
       this.perception.process(frame, frameTime)
+      prof.lap('hand detect')
       // Refine the arm mask first: the observation below reads the silhouette
       // through it, so it has to describe THIS frame, not the network's last.
       this.perception.refineArm(frame, frameTime)
+      prof.lap('mask refine')
+      prof.add('mask refine: pixel read', this.perception.arm.armMask ? this.perception.arm.stats.readMs : 0)
+      prof.add('mask refine: net mask read', this.perception.arm.stats.netReadMs)
 
       // Re-solve whenever either detector produced something new, not just the
       // hand: in pose-only mode the hand never updates at all.
@@ -436,6 +463,7 @@ export class VTOEngine {
       if (this.capture && this.perception.handTimestamp === frameTime) {
         this.capture.onFrame(this._captureSample(frame, frameTime, observation))
       }
+      prof.lap('observe')
     }
 
     // --- Twin (predicted to *now*, not to the last detection) --------------
@@ -443,6 +471,7 @@ export class VTOEngine {
     const presence = this.tracker.presence
 
     this._updateCalibration()
+    prof.lap('track')
 
     // --- Fit + physics ------------------------------------------------------
     // A wrist size just became known (first measurement, or after Re-measure):
@@ -458,6 +487,7 @@ export class VTOEngine {
     if (twin.valid) {
       this._solveStack(twin, dt)
     }
+    prof.lap('physics')
 
     // --- Lighting -----------------------------------------------------------
     if (this.options.lightEstimation) {
@@ -470,6 +500,7 @@ export class VTOEngine {
     } else {
       this.lighting.enabled = false
     }
+    prof.lap('lighting')
 
     // --- Occlusion ----------------------------------------------------------
     this.occluder.update(twin)
@@ -516,14 +547,33 @@ export class VTOEngine {
       this.renderer.domElement.height,
     )
 
+    prof.lap('scene')
+
     // --- Render -------------------------------------------------------------
     this.renderer.clear(true, true, false)
     this.renderer.render(this.bgScene, this.bgCamera)
     this.renderer.clearDepth()
     this.renderer.render(this.scene, this.camera)
     this.segmentationDebug.render(this.renderer)
+    prof.lap('render')
+
+    // --- Arm network: queued last (PerceptionSystem.segment), read next frame
+    if (fresh) {
+      this.perception.segment(this._frame, this._displayTime)
+      prof.lap('arm network (queue)')
+    }
 
     this._updateDiagnostics(now, twin, presence, fresh, workStart)
+  }
+
+  /** Hand the preferFrameRate option to the camera when it changes (and once per stream). */
+  _applyExposure() {
+    const want = !!this.options.preferFrameRate
+    if (want === this._exposureWant) return
+    this._exposureWant = want
+    this.stream.preferFrameRate(want).then((state) => {
+      this.diagnostics.cameraExposure = state
+    })
   }
 
   /**
@@ -728,9 +778,20 @@ export class VTOEngine {
     drawn.push(done)
     while (drawn.length && done - drawn[0] > 1000) drawn.shift()
     d.fps = drawn.length > 1 ? Math.round(((drawn.length - 1) * 1000) / (drawn[drawn.length - 1] - drawn[0])) : 0
-    // Main-thread time spent on this image (perception, solve, draw calls), ms.
-    this._workMs += (done - workStart - this._workMs) * 0.1
-    d.frameMs = +this._workMs.toFixed(1)
+    // Frame time is per CAMERA frame - the work that has to fit between two of
+    // them. Unlocked, the redraws in between (a new image of the same frame)
+    // would otherwise dilute it: 177 draws/s showed hand detection as 0.5 ms.
+    if (fresh) {
+      this._prof.end()
+      if (++this._profFrames % 30 === 0) {
+        d.profile = this._prof.summary()
+        const mode = this.stream.trackSettings
+        d.cameraMode = mode ? `${mode.width}×${mode.height} @ ${Math.round(mode.frameRate)}` : ''
+      }
+      // Main-thread time spent on this camera frame (perception, solve, draw calls), ms.
+      this._workMs += (done - workStart - this._workMs) * 0.1
+      d.frameMs = +this._workMs.toFixed(1)
+    }
     // Camera capture -> image submitted, ms; known only where the browser
     // reports capture times. The compositor adds about one display frame.
     if (fresh && this.stream.frameTimeSource === 'capture') {

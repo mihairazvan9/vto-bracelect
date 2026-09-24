@@ -4,36 +4,30 @@ import { VTOEngine } from './vto/VTOEngine.js'
 import { CATALOG, getBracelet } from './vto/assets/catalog.js'
 import { DEFAULT_LIVELINESS } from './vto/physics/tuning.js'
 import VtoStage from './components/VtoStage.vue'
-import CatalogPanel from './components/CatalogPanel.vue'
-import FitPanel from './components/FitPanel.vue'
-import DiagnosticsPanel from './components/DiagnosticsPanel.vue'
+import { ControlGui } from './gui/ControlGui.js'
 /**
  * The test-clip recorder is a development tool: it writes into fixtures/
  * through the dev server. Loaded lazily behind DEV, so a production build
  * drops it entirely.
  */
 const DEV = import.meta.env.DEV
-const CapturePanel = DEV ? defineAsyncComponent(() => import('./components/CapturePanel.vue')) : null
 const CaptureOverlay = DEV ? defineAsyncComponent(() => import('./components/CaptureOverlay.vue')) : null
 
+/**
+ * The screen is the camera, full width and height; everything else - camera,
+ * bracelets, fit, settings, debug views, engine numbers - lives in one lil-gui
+ * panel over it (gui/ControlGui.js). The only other thing ever drawn over the
+ * video is the clip recorder's coaching, while it records.
+ */
 const stage = ref(null)
 const engine = shallowRef(null)
 
 const status = ref('idle') // idle | starting | running | error
 const errorMessage = ref('')
-const selected = ref([])
+/** The piece worn at start: the Heirloom Charm Bracelet, 188 mm. */
+const DEFAULT_PIECE = 'charm-heirloom'
+const selected = ref([DEFAULT_PIECE])
 const manualWrist = ref(null)
-
-const calibration = reactive({ active: true, coverage: 0, locked: false, prompt: '' })
-const diagnostics = reactive({
-  fps: 0, state: 'LOST', handHz: 0, segHz: 0, handMs: 0, segMs: 0, presence: 0,
-  wristKnown: false, wristWidthMm: 0, wristDepthMm: 0, circumferenceMm: 0, shapeLocked: false, wristRemembered: false,
-  visualFitConfidence: 0, physicalSizeConfidence: 0,
-  jitterPx: 0, jitterDeg: 0, breathingPct: 0, sleeveLimitMm: Infinity,
-  rollDeg: 0, dorsalAgreement: 0, angularSpeedDeg: 0,
-  reprojectionPx: 0, forearmCorrectionDeg: 0, forearmFromSilhouette: false, refineMs: 0, maskActive: false,
-  cameraFps: 0, frameMs: 0, latencyMs: 0,
-})
 const options = reactive({
   lightEstimation: true,
   showOccluder: false,
@@ -43,15 +37,16 @@ const options = reactive({
   showWalls: false,
   physicsLiveliness: DEFAULT_LIVELINESS,
   frameLock: true,
+  preferFrameRate: false,
   rawPose: false,
 })
-const fits = ref([])
 
 const capturing = ref(false)
 const captureView = reactive({ active: false, status: 'idle', checks: [], results: {} })
 let captureSession = null
 let capturePollId = null
 
+let gui = null
 let pollId = null
 
 async function start() {
@@ -67,10 +62,8 @@ async function start() {
     // Dev builds only: lets the headless smoke test (tools/eval/live-smoke.mjs)
     // read live diagnostics. Stripped from production builds.
     if (import.meta.env.DEV) window.__vto = vto
-    if (selected.value.length === 0) selected.value = [CATALOG[0].id]
     syncStack()
     status.value = 'running'
-    pollId = setInterval(poll, 120)
   } catch (err) {
     console.error(err)
     status.value = 'error'
@@ -79,15 +72,6 @@ async function start() {
         ? 'Camera permission was denied. Allow camera access and try again.'
         : (err?.message ?? String(err))
   }
-}
-
-function poll() {
-  const vto = engine.value
-  if (!vto) return
-  Object.assign(diagnostics, vto.diagnostics)
-  Object.assign(calibration, vto.calibration)
-  // No verdicts against a wrist that has not been measured yet.
-  fits.value = vto.diagnostics.wristKnown ? vto.instances.map((inst) => ({ ...inst.fit, name: inst.asset.name })) : []
 }
 
 function syncStack() {
@@ -106,7 +90,7 @@ function setManualWrist(mm) {
   engine.value?.setManualWristCircumference(mm)
 }
 
-function setOption({ key, value }) {
+function setOption(key, value) {
   options[key] = value
   if (engine.value) engine.value.options[key] = value
 }
@@ -131,165 +115,53 @@ function closeCapture() {
 }
 
 onMounted(() => {
-  // Camera access needs a user gesture on most browsers, so we wait for one.
+  gui = new ControlGui({
+    catalog: CATALOG,
+    options,
+    getEngine: () => engine.value,
+    status: () => status.value,
+    error: () => errorMessage.value,
+    start,
+    flip: () => engine.value?.flipCamera(),
+    selected: () => selected.value,
+    toggle,
+    manualWrist: () => manualWrist.value,
+    setManualWrist,
+    setOption,
+    // No verdicts against a wrist that has not been measured yet.
+    fits: () => (engine.value?.diagnostics.wristKnown
+      ? engine.value.instances.map((inst) => ({ ...inst.fit, name: inst.asset.name }))
+      : []),
+    capture: DEV
+      ? {
+          isOpen: () => capturing.value,
+          open: openCapture,
+          close: closeCapture,
+          view: () => captureView,
+          start: () => captureSession?.start(),
+          redo: (id) => captureSession?.redo(id),
+          skip: () => captureSession?.skip(),
+          stop: () => captureSession?.stop(),
+        }
+      : null,
+  })
+  pollId = setInterval(() => gui.refresh(), 120)
+  // The camera starts straight away: the browser asks for permission (a
+  // camera does not need a click to start, only the permission). The panel's
+  // "Start camera" stays for a retry after a refusal or an error.
+  start()
 })
 
 onBeforeUnmount(() => {
   if (pollId) clearInterval(pollId)
+  gui?.destroy()
   closeCapture()
   engine.value?.dispose()
 })
 </script>
 
 <template>
-  <div class="app">
-    <header class="app__bar">
-      <div class="brand">
-        <span class="brand__mark" />
-        <span class="brand__name">MakeMeTryOn</span>
-        <span class="brand__sub">Bracelet Fitting Engine</span>
-      </div>
-      <div class="app__actions">
-        <button v-if="DEV && status === 'running'" class="ghost" @click="capturing ? closeCapture() : openCapture()">
-          {{ capturing ? 'Back to try-on' : 'Record test clips' }}
-        </button>
-        <button v-if="status === 'running'" class="ghost" @click="engine.flipCamera()">Flip camera</button>
-      </div>
-    </header>
-
-    <main class="app__body">
-      <VtoStage
-        ref="stage"
-        :calibration="calibration"
-        :state="diagnostics.state"
-        :presence="diagnostics.presence"
-        :camera-fps="diagnostics.cameraFps"
-        :quiet="capturing"
-        @skip-calibration="engine?.skipCalibration()"
-      >
-        <CaptureOverlay v-if="capturing" :view="captureView" />
-        <div v-if="status !== 'running'" class="gate">
-          <div class="gate__card">
-            <h1>Try bracelets on, at their real size.</h1>
-            <p>
-              We build a metric model of your wrist from the camera, then fit each piece
-              at its manufactured dimensions — no resizing the jewellery to your arm.
-            </p>
-            <button class="primary" :disabled="status === 'starting'" @click="start">
-              {{ status === 'starting' ? 'Starting camera…' : 'Start camera' }}
-            </button>
-            <p v-if="errorMessage" class="gate__error">{{ errorMessage }}</p>
-            <p class="gate__note">Video never leaves your device. All processing runs locally.</p>
-          </div>
-        </div>
-      </VtoStage>
-
-      <aside class="app__side">
-        <CapturePanel
-          v-if="capturing"
-          :view="captureView"
-          @start="captureSession?.start()"
-          @redo="(id) => captureSession?.redo(id)"
-          @skip="captureSession?.skip()"
-          @stop="captureSession?.stop()"
-          @close="closeCapture"
-        />
-        <template v-else>
-          <CatalogPanel :catalog="CATALOG" :selected="selected" @toggle="toggle" />
-          <FitPanel
-            :fits="fits"
-            :diagnostics="diagnostics"
-            :manual-wrist="manualWrist"
-            @set-manual-wrist="setManualWrist"
-            @recalibrate="engine?.recalibrate()"
-          />
-        </template>
-        <DiagnosticsPanel :diagnostics="diagnostics" :options="options" @update:option="setOption" />
-      </aside>
-    </main>
-  </div>
+  <VtoStage ref="stage">
+    <CaptureOverlay v-if="capturing" :view="captureView" />
+  </VtoStage>
 </template>
-
-<style scoped>
-.app {
-  height: 100vh;
-  display: flex;
-  flex-direction: column;
-  background: #0b0c0f;
-  color: #e6e8ec;
-}
-
-.app__bar {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 13px 18px;
-  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
-}
-
-.brand { display: flex; align-items: center; gap: 9px; }
-
-.brand__mark {
-  width: 17px; height: 17px; border-radius: 50%;
-  background: linear-gradient(140deg, #f2cf86, #b8853a);
-  box-shadow: inset -2px -3px 5px rgba(0, 0, 0, 0.35);
-}
-
-.brand__name { font-size: 14px; font-weight: 600; letter-spacing: 0.01em; }
-.brand__sub { font-size: 11.5px; color: #6f757d; margin-left: 3px; }
-
-.ghost {
-  background: rgba(255, 255, 255, 0.05);
-  border: 1px solid rgba(255, 255, 255, 0.1);
-  color: #c9ced5; font-size: 12px;
-  padding: 6px 12px; border-radius: 7px; cursor: pointer;
-}
-.ghost:hover { background: rgba(255, 255, 255, 0.09); }
-
-.app__body {
-  flex: 1;
-  min-height: 0;
-  display: flex;
-  gap: 14px;
-  padding: 14px;
-}
-
-.app__side {
-  width: 320px;
-  flex: none;
-  overflow-y: auto;
-  display: flex;
-  flex-direction: column;
-  gap: 20px;
-  padding-right: 4px;
-}
-
-.gate {
-  position: absolute;
-  inset: 0;
-  display: grid;
-  place-items: center;
-  background: radial-gradient(circle at 50% 40%, #16181d, #08090b);
-  padding: 24px;
-}
-
-.gate__card { max-width: 420px; text-align: center; }
-.gate__card h1 { margin: 0 0 12px; font-size: 25px; line-height: 1.25; font-weight: 600; }
-.gate__card p { margin: 0 0 18px; font-size: 13.5px; line-height: 1.6; color: #969ca4; }
-
-.primary {
-  background: linear-gradient(140deg, #f2cf86, #c79a51);
-  border: none; color: #1a1206;
-  font-size: 14px; font-weight: 600;
-  padding: 11px 26px; border-radius: 9px; cursor: pointer;
-}
-.primary:disabled { opacity: 0.6; cursor: default; }
-
-.gate__error { color: #d66560; font-size: 12.5px; margin-top: 14px; }
-.gate__note { font-size: 11px; color: #5e646c; margin-top: 16px; }
-
-@media (max-width: 900px) {
-  .app__body { flex-direction: column; }
-  .app__side { width: auto; }
-}
-</style>

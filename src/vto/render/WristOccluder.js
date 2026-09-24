@@ -1,9 +1,28 @@
 import * as THREE from 'three'
-import { TUBE_START_MM } from '../physics/walls.js'
+import { BACKSTOP_FAR_MM, BACKSTOP_NEAR_MM, ELBOW_FLARE_FROM_MM, HAND_FLARE_FROM_MM } from '../physics/walls.js'
+import { contactSection } from '../physics/armTube.js'
 
 const RADIAL = 28
-/** The tube's hand end: only a short lip past the start wall (see walls.js). */
-const EXTRA_S = TUBE_START_MM
+/**
+ * Where the tube has a ring, mm along the forearm. It covers everywhere the
+ * physics lets a piece go - onto the hand flare and up the elbow-side cone,
+ * to the backstops (walls.js) - with the twin's own sections (0 ... 88) and
+ * the flares' kinks among them. It used to run from -4 to 88 mm only; with
+ * pieces sliding freely, 40-66 % of the frames on the recordings had a piece
+ * partly past an end, and its back half showed through the arm there.
+ */
+const STATIONS = [
+  BACKSTOP_NEAR_MM, -20, -16, -12, -9, -6, -3, 0, 3, HAND_FLARE_FROM_MM, 9, 18, 28, 40, 54, 70,
+  ELBOW_FLARE_FROM_MM, 80, 88, 96, 104, BACKSTOP_FAR_MM,
+]
+/**
+ * The mask trims the tube only where its surface turns away from the camera
+ * (|normal . view| below this): at its outline, where the trim makes the edge
+ * match the real arm. Across the middle of the arm a weak mask patch (shadow,
+ * a crease, motion) is a hole in the MASK, not in the arm - trimmed there, the
+ * back of a bracelet showed through it. 0.6 = the outer fifth of each side.
+ */
+const TRIM_FACING = 0.6
 
 const MASK_TRIM_GLSL = /* glsl */ `
   uniform sampler2D uMask;
@@ -81,7 +100,9 @@ const MASK_TRIM_GLSL = /* glsl */ `
  */
 export class WristOccluder {
   constructor() {
-    this.sectionCount = 9 // one extra ring toward the hand
+    /** Stations of the tube's rings, mm along the forearm (STATIONS). */
+    this.stations = STATIONS
+    this.sectionCount = STATIONS.length
     this.geometry = this._buildGeometry()
 
     this.maskTexture = new THREE.DataTexture(new Uint8Array([255]), 1, 1, THREE.RedFormat)
@@ -103,20 +124,28 @@ export class WristOccluder {
       uArmBack: { value: 0 },
       uMirror: { value: 0 },
       uPresence: { value: 1 },
+      uTrimFacing: { value: TRIM_FACING },
     }
     this.uniforms = shared
 
     this.depthMaterial = new THREE.ShaderMaterial({
       uniforms: shared,
       vertexShader: /* glsl */ `
+        varying float vFacing;
         void main() {
-          gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+          vec4 mv = modelViewMatrix * vec4(position, 1.0);
+          // How squarely the surface faces the camera: 1 across the middle of
+          // the arm, 0 at its outline (either side of the tube, so abs).
+          vFacing = abs(dot(normalize(normalMatrix * normal), normalize(-mv.xyz)));
+          gl_Position = projectionMatrix * mv;
         }
       `,
       fragmentShader: /* glsl */ `
         ${MASK_TRIM_GLSL}
+        uniform float uTrimFacing;
+        varying float vFacing;
         void main() {
-          if (armCoverage() < 0.4) discard;
+          if (vFacing < uTrimFacing && armCoverage() < 0.4) discard;
           // Normally colour is off entirely and this pass writes depth only.
           // With colour on for debugging it draws a flat tint: an opaque black
           // fill would hide the arm rather than reveal the twin.
@@ -199,8 +228,9 @@ export class WristOccluder {
     const shape = this._shape
     let changed = false
     for (let r = 0; r < this.sectionCount; r++) {
-      const s = r === 0 ? EXTRA_S : twin.crossSections[r - 1].s
-      twin.sectionAt(Math.max(0, s), _section)
+      const s = STATIONS[r]
+      // The surface the physics uses: the arm, with its flares (armTube.js).
+      contactSection(twin, s, 1, _section)
       const k = r * 3
       if (
         !(Math.abs(shape[k] - s) < 0.01) ||
@@ -223,13 +253,8 @@ export class WristOccluder {
     let v = 0
     for (let r = 0; r < this.sectionCount; r++) {
       const s = shape[r * 3]
-      let a = shape[r * 3 + 1]
-      let b = shape[r * 3 + 2]
-      if (s < 0) {
-        // Toward the hand the arm narrows slightly into the wrist crease.
-        a *= 0.98
-        b *= 0.98
-      }
+      const a = shape[r * 3 + 1]
+      const b = shape[r * 3 + 2]
       for (let i = 0; i < RADIAL; i++) {
         const phi = (i / RADIAL) * Math.PI * 2
         pos[v * 3] = Math.cos(phi) * a

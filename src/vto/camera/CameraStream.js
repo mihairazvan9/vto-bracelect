@@ -78,6 +78,39 @@ export class CameraStream {
     return s ? { width: s.width, height: s.height, frameRate: s.frameRate } : null
   }
 
+  /**
+   * Keep the frame rate over the brightness: cap the exposure time at one
+   * frame of the camera's mode. In dim light a webcam's automatic exposure
+   * lengthens each exposure until its mode's 30 fps drops to 10-15; capped,
+   * it keeps the rate and the picture is darker. Only where the camera lets
+   * the browser set exposure (Image Capture constraints) - many do not.
+   *
+   * @param {boolean} on  cap it, or give exposure back to the camera
+   * @returns {Promise<'capped'|'auto'|'unsupported'>} what now holds
+   */
+  async preferFrameRate(on) {
+    const track = this.stream?.getVideoTracks?.()[0]
+    const caps = track?.getCapabilities?.() ?? {}
+    const modes = caps.exposureMode ?? []
+    if (!track || !modes.includes('manual') || !caps.exposureTime) return 'unsupported'
+    try {
+      if (!on) {
+        if (modes.includes('continuous')) await track.applyConstraints({ advanced: [{ exposureMode: 'continuous' }] })
+        return 'auto'
+      }
+      // exposureTime is in units of 100 microseconds.
+      const fps = track.getSettings?.().frameRate || 30
+      const frame = 10000 / fps
+      const now = track.getSettings?.().exposureTime
+      const time = Math.min(caps.exposureTime.max, Math.max(caps.exposureTime.min, Math.min(now > 0 ? now : frame, frame * 0.9)))
+      await track.applyConstraints({ advanced: [{ exposureMode: 'manual', exposureTime: time }] })
+      return 'capped'
+    } catch (err) {
+      console.warn('[VTO] camera exposure could not be set', err)
+      return 'unsupported'
+    }
+  }
+
   /** Keep frameMeta current, for as long as this stream is the live one. */
   _watchFrames() {
     const video = this.video
@@ -159,15 +192,23 @@ export class CameraStream {
   async start({ facingMode = 'user', width = 1280, height = 720 } = {}) {
     await this.stop()
     this.facingMode = facingMode
-    this.stream = await navigator.mediaDevices.getUserMedia({
-      audio: false,
-      video: {
-        facingMode,
-        width: { ideal: width },
-        height: { ideal: height },
-        frameRate: { ideal: 60, min: 24 },
-      },
-    })
+    const video = {
+      facingMode,
+      width: { ideal: width },
+      height: { ideal: height },
+      // The minimum steers the browser to a mode of 24 fps or more (webcams
+      // often offer 720p at 30 fps compressed and 10 fps raw)...
+      frameRate: { ideal: 60, min: 24 },
+    }
+    try {
+      this.stream = await navigator.mediaDevices.getUserMedia({ audio: false, video })
+    } catch (err) {
+      if (err?.name !== 'OverconstrainedError') throw err
+      // ...but a camera that has no such mode was refused outright, and the
+      // app never started (a 10 fps camera, live). Take what it has.
+      video.frameRate = { ideal: 60 }
+      this.stream = await navigator.mediaDevices.getUserMedia({ audio: false, video })
+    }
     this.video.srcObject = this.stream
     await this.video.play()
     await new Promise((resolve) => {

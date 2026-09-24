@@ -119,7 +119,10 @@ async function runApp(segEvery) {
     if (!f.lm.some((p) => p.x || p.y)) { masks.push(null); continue }
     const t0 = performance.now()
     const geom = ArmSegmenter.geometry(f.lm, f.W, f.H)
-    if (i % segEvery === 0) arm.segment(multiclass, f.frame, ++ts, geom)
+    if (i % segEvery === 0) {
+      arm.segment(multiclass, f.frame, ++ts, geom)
+      arm.adoptNet() // same-frame, as this replay has always measured it
+    }
     arm.netTime = t - (i % segEvery) * 33 // network age in the replay's clock
     arm.refine(f.frame, t, geom)
     ms += performance.now() - t0

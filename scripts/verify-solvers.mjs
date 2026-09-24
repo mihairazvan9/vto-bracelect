@@ -1233,16 +1233,24 @@ for (const id of ['tennis-brilliant', 'chain-rope-14k', 'charm-heirloom']) {
       occluder.update(twin)
       // A ring vertex, placed by the matrix, sits exactly on the twin's section.
       const pos = occluder.geometry.attributes.position.array
-      const r = 3
+      const sec = twin.crossSections[2]
+      const r = occluder.stations.indexOf(sec.s) // the ring at the twin's 18 mm section
       const k = r * 28 * 3
       const v = new THREE.Vector3(pos[k], pos[k + 1], pos[k + 2]).applyMatrix4(occluder.depthMesh.matrix)
-      const sec = twin.crossSections[r - 1]
       const want = sec.center.clone().addScaledVector(twin.radialAxis, sec.a)
       worst = Math.max(worst, v.distanceTo(want))
     }
     const same = occluder.geometry.attributes.position.array.every((x, i) => x === built[i])
     check('occluder: the tube is built once and only moved by the pose', occluder.rebuilds === 1 && same, `${occluder.rebuilds} builds`)
     check('occluder: ...and sits exactly on the arm', worst < 1e-3, `${worst.toExponential(1)} mm`)
+    // Wherever the physics can put a piece, the occluder is there to hide its
+    // back half: from backstop to backstop (walls.js), flares included.
+    const st = occluder.stations
+    check(
+      'occluder: it spans everywhere a piece can go',
+      st[0] <= BACKSTOP_NEAR_MM && st[st.length - 1] >= BACKSTOP_FAR_MM,
+      `${st[0]}..${st[st.length - 1]} mm, backstops ${BACKSTOP_NEAR_MM}/${BACKSTOP_FAR_MM}`,
+    )
     twin.crossSections.forEach((sec) => {
       sec.a += 1
     })

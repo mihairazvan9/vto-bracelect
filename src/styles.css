@@ -31,3 +31,24 @@ body {
   background: rgba(255, 255, 255, 0.12);
   border-radius: 4px;
 }
+
+/* The lil-gui control panel (gui/ControlGui.js): the whole interface, over the full-screen camera. */
+.control-gui {
+  --width: 360px;
+  --name-width: 46%;
+  max-height: calc(100vh - 16px);
+  overflow-y: auto;
+}
+/* Read-only values are disabled inputs: keep them readable, not greyed out. */
+.control-gui .control-gui__value.lil-disabled {
+  opacity: 1;
+}
+.control-gui .control-gui__value.lil-disabled input {
+  color: #cfd5dc;
+  background: transparent;
+}
+/* ...and hoverable, so a long value (a fit verdict) shows in full as a tooltip. Still not editable. */
+.control-gui .control-gui__value.lil-disabled,
+.control-gui .control-gui__value.lil-disabled * {
+  pointer-events: auto !important;
+}

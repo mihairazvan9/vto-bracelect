@@ -30,19 +30,9 @@ export class PerceptionSystem {
     this.segIntervalMs = 1000 / 12
     this.lastHandTime = -Infinity
     this.lastSegTime = -Infinity
-    /**
-     * Per-camera-frame detection budget, ms. The hand always runs when due;
-     * the arm network joins it only if its recent cost still fits. At 14 ms
-     * the network (15-23 ms at 720p) regularly took the hand's slot and the
-     * hand was detected at 18 Hz off a 30 fps camera; at 28 ms hand (~11 ms)
-     * plus network (~20 ms) did not fit and the network fell to 6 Hz. A
-     * camera frame lasts 33 ms, and the jewellery only changes when one
-     * arrives, so spending most of it on detection costs at most a repeated
-     * display frame.
-     */
-    this.frameBudgetMs = 32
-    /** Recent cost of each stage, ms (for the budget decision). */
-    this._segCost = 18
+    // (No per-frame budget between the two any more: the network used to cost
+    // ~20 ms of main thread and had to be fitted beside the hand; queued at the
+    // end of the frame and read on the next (see segment), it costs ~0.3.)
 
     this.hands = null
     this.handTimestamp = 0
@@ -57,6 +47,8 @@ export class PerceptionSystem {
     this.handGeometry = null
 
     this.stats = { handMs: 0, segMs: 0, handHz: 0, segHz: 0, refineMs: 0 }
+    /** What the last process() / segment() call spent on its stage, ms (0 = it did not run). */
+    this.frameCost = { hand: 0, seg: 0 }
     this._handHzStat = []
     this._segHzStat = []
   }
@@ -105,39 +97,41 @@ export class PerceptionSystem {
   }
 
   /**
-   * Run whatever is due on this camera frame.
-   *
-   * The hand goes first whenever it is due: it IS the pose, and every frame
-   * it misses is a frame the bracelet is predicted instead of measured. The
-   * arm network runs after it, when its recent cost still fits the frame's
-   * budget - or regardless, once it is two intervals late, so it can never
-   * be starved outright (a stale mask is refused downstream anyway).
+   * Detect the hand on this camera frame, when due (every frame up to 60 fps):
+   * it IS the pose, and every frame it misses is a frame the bracelet is
+   * predicted instead of measured. The arm network is queued separately, at
+   * the end of the frame (segment).
    *
    * @param {{image: TexImageSource, width: number, height: number}} frame
    *        one camera frame (CameraStream.takeFrame); every stage reads it
-   *
-   * (Picking the most overdue stage instead let the network, due less often
-   * but always "more overdue" when it was, take the hand's frame: on a 30 fps
-   * camera the hand ran at 18 Hz.)
    */
   process(frame, timestampMs) {
     if (!this.ready) return
     this.videoWidth = frame.width
     this.videoHeight = frame.height
-    const start = performance.now()
+    this.frameCost.hand = 0
 
     if (timestampMs - this.lastHandTime >= this.handIntervalMs * 0.8) {
       this._runStage('hand', frame, timestampMs)
     }
+  }
+
+  /**
+   * Queue the arm network on this frame, when it is due. Call LAST in the
+   * frame, after everything that reads pixels back from the GPU: any such read
+   * (the hand's landmarks, the mask refinement's pixels) makes the main thread
+   * wait for all GPU work queued before it, and the network is ~18 ms of it.
+   * Queued last, it runs in the gap before the next camera frame; its mask is
+   * read on the next frame (ArmSegmenter.adoptNet). Live, the network used to
+   * cost 19-21 ms of main thread on the frames it ran; it now costs ~0.3.
+   */
+  segment(frame, timestampMs) {
+    this.frameCost.seg = 0
     // The arm network looks at the wrist crop, so it has nothing to do until
     // there is a hand to crop around.
-    if (!this.segmenter || !this.handGeometry) return
-    const overdue = (timestampMs - this.lastSegTime) / this.segIntervalMs
-    if (overdue < 1) return
-    const spent = performance.now() - start
-    if (overdue >= 2 || spent + this._segCost <= this.frameBudgetMs) {
-      this._runStage('seg', frame, timestampMs)
-    }
+    if (!this.ready || !this.segmenter || !this.handGeometry) return
+    if (timestampMs - this.lastSegTime < this.segIntervalMs) return
+    this._runStage('seg', frame, timestampMs)
   }
 
   _runStage(stage, frame, timestampMs) {
@@ -153,6 +147,7 @@ export class PerceptionSystem {
         console.warn('[VTO] hand detection failed', err)
       }
       this.stats.handMs = performance.now() - t0
+      this.frameCost.hand = this.stats.handMs
       this._tickRate(this._handHzStat, timestampMs, 'handHz')
       this.lastHandTime = timestampMs
       return
@@ -166,7 +161,7 @@ export class PerceptionSystem {
         console.warn('[VTO] segmentation failed', err)
       }
       this.stats.segMs = performance.now() - t0
-      this._segCost += (this.stats.segMs - this._segCost) * 0.3
+      this.frameCost.seg = this.stats.segMs
       this._tickRate(this._segHzStat, timestampMs, 'segHz')
       this.lastSegTime = timestampMs
     }

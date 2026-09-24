@@ -94,7 +94,7 @@ const PITCH_TAU_S = 0.6
  * occluder's extra ring) to this far up the forearm (its last section).
  */
 const ARM_TUBE_LENGTH_MM = 92
-const ARM_TUBE_BACK_MM = 4 // the tube's hand-end lip (physics/walls.js TUBE_START_MM)
+const ARM_TUBE_BACK_MM = 4 // a short lip past the wrist crease: the outline is the FOREARM's; the hand is wider
 
 /** Where down the arm its apparent width is read as a depth ruler, mm. */
 const ARM_WIDTH_STATION_MM = 20

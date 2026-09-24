@@ -18,7 +18,7 @@ npm run build
 
 ### Recording test clips (dev only)
 
-`npm run dev`, start the camera, then **Record test clips** in the header. A guided script
+`npm run dev`, start the camera, then **Open recorder** in the control panel's *Record test clips* folder. A guided script
 (hold still, slow turn, wrist bend, forearm swing, closer/further, shake-then-hold, side-on,
 sleeve, free try-on) coaches the framing with arrows, counts down, and keeps a take only once
 it contains the movement asked for; a take that loses the hand or the framing is retried.
@@ -33,6 +33,14 @@ Each take is written by the dev server to `fixtures/<scenario>-<MMDD-HHMMSS>/`:
 `npm run bench -- <clip>` / `npm run bench:jewelry -- <clip>` pick them up like any other clip.
 A **fps** chip flags takes the machine or the camera could not deliver at full rate (webcams
 drop to 15 fps in dim light). Clips are video of a real person: they stay out of git.
+
+## The screen
+
+The camera, full width and height, and nothing else but one lil-gui control panel over it
+(`gui/ControlGui.js`): camera start / flip, guidance (tracking state, measuring progress,
+low light), the bracelets (stack order), fit and wrist size, settings, debug views, engine
+numbers, frame time and - in dev - the clip recorder. The recorder's coaching is the only thing
+ever drawn over the video, and only while it records.
 
 ## Premium pass: measured, then changed
 
@@ -75,7 +83,7 @@ through a soft spring, so a real pronation reaches the piece and a tracker twitc
 - *Skin gives*: where a piece is smaller than the arm there (a wrist over-measured, or a
   piece genuinely too tight) the arm is squeezed to fit rather than fought - fighting it once
   launched a bangle off the arm at 178 rad/s.
-- One **liveliness** knob (Engine panel, calm ↔ lively, `physics/tuning.js`) replaces the
+- One **liveliness** knob (control panel *Settings*, calm ↔ lively, `physics/tuning.js`) replaces the
   stable/realistic switch: how much of the arm's motion reaches the piece and how fast it
   dies away. Calm (0.4) is the default; charms still swing ~0.8 s after the arm stops.
 
@@ -142,7 +150,7 @@ wrist's shape *relative to the palm* was steady (width ~0.62 palm); only the sca
   session adds its reading, so the prior's weight falls as sessions average out MediaPipe's
   noise. v1 memories (millimetres at MediaPipe's scale) are not carried over. *Re-measure*
   forgets it.
-- A tape-measured wrist (Fit panel) overrides all of it and is exact. It could not freeze
+- A tape-measured wrist (control panel *Fit*) overrides all of it and is exact. It could not freeze
   before - the freeze test compared the taped width with the camera's readings - and now does.
 - **No default wrist in production.** Until this session has measured the wrist (or the user
   typed a size, which is not kept between sessions) no size is shown, no fit verdict is
@@ -416,7 +424,7 @@ recorded clips, candidate pipelines run in real Chrome, scored on axis angle and
 
 ### Seeing the rotation solve
 
-Turn on **Show wrist frame (rotation)** in the Engine panel. It draws every piece of
+Turn on **Wrist frame (rotation)** in the control panel's *Debug views*. It draws every piece of
 evidence the rotation solve uses:
 
 | | |
@@ -465,13 +473,28 @@ network, the mask refinement, the lighting and the background texture all read t
 snapshot. Before, each read the live `<video>`: detection takes 15-35 ms, so a newer frame
 often arrived mid-pipeline and the background was drawn a frame ahead of the pose.
 
-The loop then draws exactly once per camera frame (Engine panel: *Lock drawing to camera
+The loop then draws exactly once per camera frame (control panel *Settings*: *Lock drawing to camera
 frames*, on by default), with physics advanced by the frame's own spacing. Redrawing at the
 display's 120-180 Hz showed nothing new and took GPU time from the hand detector; the panel's
 fps is now images actually drawn, next to the camera's rate, per-image main-thread time and
 capture-to-draw latency. Live, a 30 fps clip as the webcam: 30 drawn / 30 camera fps, hands at
 30 Hz, ~20-25 ms per image, ~25 ms latency. The hand now runs on every frame up to 60 fps (it
 was capped at 30 Hz, so a 60 fps camera had every other frame predicted).
+
+**Where a frame's time goes** (control panel *Frame time*, `core/StageProfiler.js`; live, a
+30 fps clip as the webcam, no debug overlays, main-thread ms mean / p95): hand detection
+10.8 / 19, mask refinement 6.0 / 11.6, observation 2.3 / 3.6, lighting 0.7 / 2.4, render
+0.3, physics 0.2, tracking ~0. Almost all of it is WAITING FOR THE GPU: a MediaPipe result
+read back to JavaScript blocks until the GPU has finished everything queued before it. The
+arm network looked cheap to queue (~1 ms) but reading its mask cost 19.6 ms (p95) of the
+frame it ran on. It is now queued LAST in the frame, after every GPU read, and its mask is
+read on the next frame (`ArmSegmenter.adoptNet`): mean 23.2 -> 20.9 ms per image, worst
+frames ~37 -> ~30 ms. It does not vanish - on this GPU the network is ~18 ms of GPU work,
+more than the gap between 30 fps frames, and the rest is waited for by the next frame's hand
+detection. At a 60 fps camera the pipeline draws ~40-45 fps; 60 needs the MediaPipe work off
+the main thread (a worker, with the frame snapshot transferred) or a lighter segmentation
+model. A camera with no mode of 24 fps or more used to be refused and the app never started;
+it now falls back to what the camera has.
 
 Measured on the recordings (`npm run scorecard -- --hz camera`), per camera frame on screen:
 tracking is identical (the pose was already per camera frame), rim shake and jumps are equal

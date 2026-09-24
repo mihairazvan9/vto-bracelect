@@ -145,16 +145,14 @@ export class CaptureSession {
   _raiseBudget() {
     const p = this.engine.perception
     if (this._budget) return
-    this._budget = { hand: p.handIntervalMs, frame: p.frameBudgetMs }
+    this._budget = { hand: p.handIntervalMs }
     p.setBudget({ handHz: 60 })
-    p.frameBudgetMs = Math.max(p.frameBudgetMs, 34)
   }
 
   _restoreBudget() {
     if (!this._budget) return
     const p = this.engine.perception
     p.handIntervalMs = this._budget.hand
-    p.frameBudgetMs = this._budget.frame
     this._budget = null
   }
 

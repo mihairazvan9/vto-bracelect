@@ -26,7 +26,8 @@ const W = frames[0].width
 const H = frames[0].height
 const y4m = path.join(OUT, `${clip}.y4m`)
 const fd = fs.openSync(y4m, 'w')
-fs.writeSync(fd, `YUV4MPEG2 W${W} H${H} F30:1 Ip A1:1 C420jpeg\n`)
+// FPS=60 plays the clip as a 60 fps camera (twice as fast): does the pipeline keep up?
+fs.writeSync(fd, `YUV4MPEG2 W${W} H${H} F${Number(process.env.FPS) || 30}:1 Ip A1:1 C420jpeg\n`)
 const order = [...frames, ...frames.slice(1, -1).reverse()]
 for (const img of order) {
   const Y = Buffer.alloc(W * H)
@@ -72,9 +73,11 @@ try {
   page.on('console', (m) => { if (m.type() === 'error' || m.type() === 'warning') errors.push(m.text()) })
   page.on('pageerror', (e) => errors.push('PAGEERROR ' + e.message))
   await page.goto('http://localhost:5198/', { waitUntil: 'networkidle2' })
-  await page.click('button.primary')
+  // The app starts the camera by itself (App.vue).
   await page.waitForFunction(() => window.__vto, { timeout: 60000 })
-  await page.evaluate((occ, walls, raw) => { window.__vto.options.showSegmentation = true; window.__vto.options.showWristFrame = true; window.__vto.options.showOccluder = occ; window.__vto.options.showWalls = walls; window.__vto.options.rawPose = raw }, !process.env.NO_OCC, !!process.env.WALLS, !!process.env.RAW)
+  // CLEAN=1: no debug overlays - what a user runs (for timing).
+  const debug = !process.env.CLEAN
+  await page.evaluate((occ, walls, raw, debug) => { window.__vto.options.showSegmentation = debug; window.__vto.options.showWristFrame = debug; window.__vto.options.showOccluder = debug && occ; window.__vto.options.showWalls = walls; window.__vto.options.rawPose = raw }, !process.env.NO_OCC, !!process.env.WALLS, !!process.env.RAW, debug)
   const samples = []
   for (let s = 0; s < seconds; s++) {
     await new Promise((r) => setTimeout(r, 1000))
@@ -91,6 +94,10 @@ try {
   }
   await page.screenshot({ path: path.join(OUT, `${clip}.png`) })
   for (const s of samples) console.log(JSON.stringify(s))
+  // Where each drawn image's main-thread time went, over its last ~4 s (ms: mean per image, p50, p95).
+  const profile = await page.evaluate(() => window.__vto.diagnostics.profile)
+  console.log('\nstage                  mean    p50    p95')
+  for (const [k, v] of Object.entries(profile)) console.log(k.padEnd(22), String(v.mean).padStart(6), String(v.p50).padStart(6), String(v.p95).padStart(6))
 } finally {
   await browser.close()
   await server.close()

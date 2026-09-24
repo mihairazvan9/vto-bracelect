@@ -72,12 +72,15 @@ export class ArmSegmenter {
     this._roi = { x: 0, y: 0, size: 0 }
     this.videoWidth = 0
     this.videoHeight = 0
-    this.stats = { refineMs: 0 }
+    /** refineMs: the whole refinement; readMs: of which reading the ROI pixels back from the frame. */
+    this.stats = { refineMs: 0, readMs: 0, netDrawMs: 0, netRunMs: 0, netReadMs: 0 }
   }
 
   reset() {
     this.hasNet = false
     this.armMask = null
+    this._pendingNet?.mask.close()
+    this._pendingNet = null
   }
 
   /**
@@ -107,31 +110,59 @@ export class ArmSegmenter {
     const cy = geom.wy + geom.ay * geom.palm * CROP_BIAS
     const crop = { x: cx - size / 2, y: cy - size / 2, size }
 
+    const t0 = performance.now()
     const g = this.netCtx
     g.fillStyle = '#000'
     g.fillRect(0, 0, NET_SIZE, NET_SIZE)
     drawCrop(g, frame.image, crop, vw, vh, NET_SIZE)
 
+    // The mask is NOT read here. Reading it (getAsFloat32Array) makes the
+    // main thread wait until the GPU has finished the network: 19.6 ms (p95)
+    // of a 33 ms frame, live. A copy stays on the GPU, and the next frame's
+    // refine() reads it - by then the GPU has finished it in the background.
+    // The network is only the prior the refinement tracks from; it is
+    // motion-compensated by how far the wrist moved since, so one frame
+    // older costs little.
     let ok = false
+    const t1 = performance.now()
     segmenter.segmentForVideo(this.netCanvas, timestampMs, (result) => {
       const conf = result.confidenceMasks?.[SEG_CLASS.BODY_SKIN]
-      if (conf && conf.width === NET_SIZE && conf.height === NET_SIZE) {
-        this.net.set(conf.getAsFloat32Array())
-        ok = true
-      } else if (conf) {
-        resampleInto(conf.getAsFloat32Array(), conf.width, conf.height, this.net, NET_SIZE)
+      if (conf) {
+        this._pendingNet?.mask.close()
+        this._pendingNet = { mask: conf.clone(), crop, wx: geom.wx, wy: geom.wy, t: timestampMs }
         ok = true
       }
       result.close?.()
     })
-    if (ok) {
-      this.netCrop = crop
-      this.netWrist.x = geom.wx
-      this.netWrist.y = geom.wy
-      this.netTime = timestampMs
-      this.hasNet = true
-    }
+    // Drawing the wrist crop; queueing the network (and copying its mask, on the GPU).
+    this.stats.netDrawMs = t1 - t0
+    this.stats.netRunMs = performance.now() - t1
     return ok
+  }
+
+  /**
+   * Take in the network result segment() left on the GPU: read its mask now.
+   * refine() does this on the frame after; offline tools that want the old
+   * same-frame behaviour call it straight after segment().
+   */
+  adoptNet() {
+    if (!this._pendingNet) return
+    const p = this._pendingNet
+    this._pendingNet = null
+    const t0 = performance.now()
+    try {
+      const data = p.mask.getAsFloat32Array()
+      if (p.mask.width === NET_SIZE && p.mask.height === NET_SIZE) this.net.set(data)
+      else resampleInto(data, p.mask.width, p.mask.height, this.net, NET_SIZE)
+      this.netCrop = p.crop
+      this.netWrist.x = p.wx
+      this.netWrist.y = p.wy
+      this.netTime = p.t
+      this.hasNet = true
+    } finally {
+      p.mask.close()
+    }
+    this.stats.netReadMs = performance.now() - t0
   }
 
   /**
@@ -143,6 +174,9 @@ export class ArmSegmenter {
     const vh = frame.height
     this.videoWidth = vw
     this.videoHeight = vh
+    // A network result from an earlier frame is ready to read (see segment).
+    this.stats.netReadMs = 0
+    if (this._pendingNet && this._pendingNet.t !== timestampMs) this.adoptNet()
     if (!geom || !this.hasNet || timestampMs - this.netTime > MAX_NET_AGE_MS) {
       this.armMask = null
       return false
@@ -168,6 +202,7 @@ export class ArmSegmenter {
     }
     /** This frame's region-of-interest pixels (RGBA), e.g. for exposure checks. */
     this.lastRoiRgba = rgba
+    this.stats.readMs = performance.now() - t0
 
     // Network prior for each ROI pixel, motion-compensated: the arm has moved
     // with the wrist since the network looked at it.
